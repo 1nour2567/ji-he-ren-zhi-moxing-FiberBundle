@@ -1,0 +1,218 @@
+import torch
+import torch.nn as nn
+import numpy as np
+import matplotlib.pyplot as plt
+
+class SparseFiberBundle(nn.Module):
+    """稀疏纤维丛近似算法 - 支持中间层监控"""
+    def __init__(self, vocab_size, d_model=64, k_neighbors=8):
+        super().__init__()
+        self.k_neighbors = k_neighbors
+        self.d_model = d_model
+        self.vocab_size = vocab_size
+        
+        # 存储中间激活值用于奇点检测
+        self.activations = {}
+        
+        # 几何编码层
+        self.geometric_layers = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(d_model, d_model),
+                nn.GELU()
+            ),
+            nn.Sequential(
+                nn.Linear(d_model, d_model),
+                nn.GELU()
+            )
+        ])
+    
+    def forward(self, x):
+        """x: [batch_size, vocab_size, d_model]"""
+        batch_size, n, d = x.shape
+        x_flat = x.view(-1, d)
+        
+        # 保存输入用于奇点检测
+        self.activations['input'] = x.clone()
+        
+        # 应用几何变换
+        for i, layer in enumerate(self.geometric_layers):
+            x_flat = layer(x_flat)
+            if i == 0:  # 保存第一层输出
+                self.activations['layer1'] = x_flat.view(batch_size, n, d).clone()
+        
+        x = x_flat.view(batch_size, n, d)
+        self.activations['output'] = x.clone()
+        return x
+
+class SingularityDrivenLearner:
+    """奇点驱动学习算法 - 修正版"""
+    def __init__(self, model):
+        self.model = model
+        self.singularity_history = []
+        self.singularity_threshold = 2.0
+    
+    def detect_singularity_in_activations(self):
+        """在所有激活层中检测奇点"""
+        detected_singularities = []
+        
+        for layer_name, activation in self.model.activations.items():
+            max_abs = torch.max(torch.abs(activation))
+            if max_abs > self.singularity_threshold:
+                positions = torch.where(torch.abs(activation) > self.singularity_threshold)
+                detected_singularities.append({
+                    'layer': layer_name,
+                    'detected': True,
+                    'type': 'Type_I',
+                    'value': max_abs.item(),
+                    'positions': positions,
+                    'count': len(positions[0])
+                })
+        
+        return detected_singularities
+    
+    def apply_repair_to_tensor(self, tensor):
+        """对张量应用修复策略"""
+        # 策略1: Clamp到合理范围
+        repaired = torch.clamp(tensor, -1.0, 1.0)
+        return repaired
+    
+    def train_step_with_proactive_repair(self, batch):
+        """主动修复模式：在前向传播中检测并修复"""
+        # 1. 前向传播
+        outputs = self.model(batch)
+        
+        # 2. 检测所有层的奇点
+        singularities = self.detect_singularity_in_activations()
+        
+        # 3. 如果检测到奇点，应用修复
+        repaired_outputs = outputs
+        if singularities:
+            # 修复输出
+            repaired_outputs = self.apply_repair_to_tensor(outputs)
+            
+            # 记录奇点历史
+            for sing in singularities:
+                self.singularity_history.append(sing)
+        
+        # 4. 计算损失
+        loss = torch.mean((repaired_outputs - batch) ** 2)
+        
+        # 5. 奇点奖励机制
+        if singularities:
+            reward = 0.1 * len(singularities)
+            loss = loss - reward
+        
+        return repaired_outputs, loss, singularities
+
+def visualize_singularity_repair_v2():
+    """可视化奇点修复过程 - 修正版"""
+    # 模拟数据
+    batch_size = 1
+    vocab_size = 20
+    d_model = 64
+    
+    # 1. 创建模型
+    model = SparseFiberBundle(vocab_size, d_model=d_model)
+    learner = SingularityDrivenLearner(model)
+    
+    # 2. 创建包含异常值的输入
+    inputs = torch.randn(batch_size, vocab_size, d_model)
+    
+    # 制造几个异常值（模拟逻辑矛盾）
+    inputs[0, 0, 0] = 10.0      # 异常值1
+    inputs[0, 5, 32] = -15.0    # 异常值2
+    inputs[0, 10, 10] = 8.0     # 异常值3
+    inputs[0, 15, 50] = -12.0   # 异常值4
+    
+    print("🔍 制造的异常值位置和值:")
+    abnormal_positions = [(0,0,0), (0,5,32), (0,10,10), (0,15,50)]
+    for pos in abnormal_positions:
+        print(f"  位置 {pos}: {inputs[0, pos[1], pos[2]].item():.2f}")
+    
+    # 3. 主动修复训练
+    outputs, loss, detected_singularities = learner.train_step_with_proactive_repair(inputs)
+    
+    # 4. 可视化对比
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    
+    # 子图1: 输入数据分布
+    input_flat = inputs[0].view(-1).detach().numpy()
+    axes[0, 0].hist(input_flat, bins=50, alpha=0.7, color='red', edgecolor='black')
+    axes[0, 0].set_title('输入数据分布 (含异常值)', fontsize=12)
+    axes[0, 0].set_xlabel('值')
+    axes[0, 0].set_ylabel('频次')
+    axes[0, 0].axvline(x=learner.singularity_threshold, color='orange', linestyle='--', label='检测阈值')
+    axes[0, 0].axvline(x=-learner.singularity_threshold, color='orange', linestyle='--')
+    axes[0, 0].legend()
+    
+    # 子图2: 输出数据分布
+    output_flat = outputs[0].view(-1).detach().numpy()
+    axes[0, 1].hist(output_flat, bins=50, alpha=0.7, color='blue', edgecolor='black')
+    axes[0, 1].set_title('输出数据分布 (修复后)', fontsize=12)
+    axes[0, 1].set_xlabel('值')
+    axes[0, 1].set_ylabel('频次')
+    axes[0, 1].axvline(x=1, color='green', linestyle='--', label='修复边界')
+    axes[0, 1].axvline(x=-1, color='green', linestyle='--')
+    axes[0, 1].legend()
+    
+    # 子图3: 修复前后对比
+    n_compare = min(100, input_flat.shape[0])
+    x_pos = np.arange(n_compare)
+    
+    axes[1, 0].plot(x_pos, input_flat[:n_compare], 'ro-', alpha=0.6, label='修复前', markersize=4)
+    axes[1, 0].plot(x_pos, output_flat[:n_compare], 'bo-', alpha=0.6, label='修复后', markersize=4)
+    axes[1, 0].set_title('修复前后对比 (前100个值)', fontsize=12)
+    axes[1, 0].set_xlabel('元素索引')
+    axes[1, 0].set_ylabel('值')
+    axes[1, 0].legend()
+    axes[1, 0].grid(True, alpha=0.3)
+    
+    # 子图4: 奇点检测详情
+    if detected_singularities:
+        layers = [s['layer'] for s in detected_singularities]
+        counts = [s['count'] for s in detected_singularities]
+        values = [s['value'] for s in detected_singularities]
+        
+        bar_colors = ['red' if layer == 'input' else 'orange' if layer == 'layer1' else 'purple' 
+                     for layer in layers]
+        
+        bars = axes[1, 1].bar(range(len(layers)), values, color=bar_colors, alpha=0.7)
+        axes[1, 1].set_title(f'各层检测到的奇点 ({len(detected_singularities)}个)', fontsize=12)
+        axes[1, 1].set_xlabel('网络层')
+        axes[1, 1].set_ylabel('最大奇点值')
+        axes[1, 1].set_xticks(range(len(layers)))
+        axes[1, 1].set_xticklabels(layers, rotation=45)
+        
+        # 添加数值标签
+        for bar, count in zip(bars, counts):
+            axes[1, 1].text(bar.get_x() + bar.get_width()/2., bar.get_height() + 0.5,
+                           f'{count}个', ha='center', va='bottom', fontsize=10)
+    else:
+        axes[1, 1].text(0.5, 0.5, '✅ 未检测到奇点\n(已成功修复)', 
+                       horizontalalignment='center', verticalalignment='center',
+                       transform=axes[1, 1].transAxes, fontsize=14)
+        axes[1, 1].set_title('奇点检测结果', fontsize=12)
+    
+    plt.tight_layout()
+    plt.show()
+    
+    # 打印详细结果
+    print(f"\n✅ 修复结果:")
+    print(f"  训练损失: {loss.item():.4f}")
+    print(f"  检测到奇点数量: {len(detected_singularities)}")
+    
+    if detected_singularities:
+        print(f"  奇点详情:")
+        for i, sing in enumerate(detected_singularities):
+            print(f"    [{i+1}] 层: {sing['layer']}, 值: {sing['value']:.2f}, 数量: {sing['count']}个")
+    
+    # 验证修复效果
+    input_max = torch.max(torch.abs(inputs)).item()
+    output_max = torch.max(torch.abs(outputs)).item()
+    print(f"  修复前最大绝对值: {input_max:.2f}")
+    print(f"  修复后最大绝对值: {output_max:.2f}")
+    print(f"  修复效果: {'✅ 成功' if output_max <= 1.0 else '⚠️ 部分修复'}")
+
+# 运行修正版可视化
+if __name__ == "__main__":
+    visualize_singularity_repair_v2()
