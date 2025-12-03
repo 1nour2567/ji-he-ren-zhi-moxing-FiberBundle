@@ -319,7 +319,11 @@ def visualize_all_types_singularity_detection():
     # 3. 全面修复训练
     outputs, loss, detected_singularities = learner.train_step_with_comprehensive_repair(inputs)
     
-    # 4. 可视化
+    # 4. 获取拓扑信息用于后续分析
+    input_topo_info = model.activations['input_topology']
+    output_topo_info = model.activations['output_topology']
+    
+    # 5. 可视化
     fig, axes = plt.subplots(3, 3, figsize=(18, 15))
     axes = axes.flatten()
     
@@ -343,20 +347,17 @@ def visualize_all_types_singularity_detection():
     axes[1].legend()
     
     # Type II: 拓扑异常
-    topo_info = model.activations['input_topology']
-    next_topo_info = model.activations['output_topology']
-    
     axes[2].bar(['输入层', '输出层'], 
-                [topo_info['n_components'], next_topo_info['n_components']], 
+                [input_topo_info['n_components'], output_topo_info['n_components']], 
                 color=['red', 'blue'], alpha=0.7)
-    axes[2].set_title(f'拓扑连通分量数\n输入: {topo_info["n_components"]}, 输出: {next_topo_info["n_components"]}', 
+    axes[2].set_title(f'拓扑连通分量数\n输入: {input_topo_info["n_components"]}, 输出: {output_topo_info["n_components"]}', 
                      fontsize=12)
     axes[2].set_ylabel('连通分量数')
     
     axes[3].bar(['输入层', '输出层'], 
-                [topo_info['density'], next_topo_info['density']], 
+                [input_topo_info['density'], output_topo_info['density']], 
                 color=['red', 'blue'], alpha=0.7)
-    axes[3].set_title(f'连接密度\n输入: {topo_info["density"]:.3f}, 输出: {next_topo_info["density"]:.3f}', 
+    axes[3].set_title(f'连接密度\n输入: {input_topo_info["density"]:.3f}, 输出: {output_topo_info["density"]:.3f}', 
                      fontsize=12)
     axes[3].set_ylabel('连接密度')
     
@@ -443,7 +444,7 @@ def visualize_all_types_singularity_detection():
     axes[7].grid(True, alpha=0.3)
     
     # 拓扑稳定性
-    topo_stable = abs(topo_info['n_components'] - next_topo_info['n_components']) <= 2
+    topo_stable = abs(input_topo_info['n_components'] - output_topo_info['n_components']) <= 2
     stability_text = '✅ 稳定' if topo_stable else '⚠️ 变化'
     axes[8].text(0.5, 0.5, f'拓扑稳定性\n{stability_text}', 
                 horizontalalignment='center', verticalalignment='center',
@@ -486,7 +487,7 @@ def visualize_all_types_singularity_detection():
     print(f"  修复效果: {'✅ 成功' if output_max <= 1.0 else '⚠️ 部分修复'}")
     
     # 拓扑稳定性分析
-    topo_stable = abs(topo_info['n_components'] - output_topo_info['n_components']) <= 2
+    topo_stable = abs(input_topo_info['n_components'] - output_topo_info['n_components']) <= 2
     print(f"  拓扑稳定性: {'✅ 稳定' if topo_stable else '⚠️ 变化较大'}")
 
 # 运行全面可视化
