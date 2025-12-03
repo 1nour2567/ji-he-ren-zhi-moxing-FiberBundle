@@ -1,0 +1,386 @@
+import torch
+import torch.nn as nn
+import numpy as np
+import matplotlib.pyplot as plt
+import math
+
+class CognitiveFiberBundle(nn.Module):
+    """认知纤维丛模型 - 陈类计算的最终实现"""
+    def __init__(self, vocab_size, d_model=64, k_neighbors=8):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+        self.k_neighbors = k_neighbors
+        
+        # 存储中间激活值用于陈类计算
+        self.activations = {}
+        
+        # 认知纤维丛的联络形式（connection form）
+        self.connection_form = nn.Parameter(torch.randn(d_model, d_model) * 0.1)
+        
+        # 简化的曲率形式计算参数
+        self.curvature_weight = nn.Parameter(torch.randn(d_model, d_model) * 0.01)
+        
+        # 几何编码层
+        self.geometric_layers = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(d_model, d_model),
+                nn.GELU()
+            ),
+            nn.Sequential(
+                nn.Linear(d_model, d_model),
+                nn.GELU()
+            )
+        ])
+    
+    def compute_connection_form(self, x):
+        """计算联络形式 A - 修复版本"""
+        batch_size, n, d = x.shape
+        x_flat = x.view(batch_size * n, d)
+        
+        # 扩展connection_form到batch维度
+        connection = self.connection_form.unsqueeze(0).expand(batch_size * n, -1, -1)
+        
+        # 简化：为每个位置添加基于输入的对角扰动
+        input_diag = torch.diag_embed(torch.mean(x_flat, dim=1, keepdim=True).expand(-1, d) * 0.01)
+        connection = connection + input_diag
+        
+        return connection
+    
+    def compute_curvature_form(self, connection):
+        """计算曲率形式 F = dA + A∧A (简化版本)"""
+        batch_size_n, d, d = connection.shape
+        
+        # 简化版本：F = A*A - A^T*A (李括号的对角占优近似)
+        A_squared = torch.bmm(connection, connection)
+        A_transposed = connection.transpose(-2, -1)
+        A_transposed_squared = torch.bmm(A_transposed, connection)
+        
+        curvature = A_squared - A_transposed_squared
+        return curvature
+    
+    def compute_chern_class(self, curvature):
+        """计算陈类 - 拓扑不变量"""
+        batch_size, d, d = curvature.shape
+        
+        # 第一陈类: c1 = tr(F) / (2πi)
+        trace_F = torch.diagonal(curvature, dim1=-2, dim2=-1).sum(dim=-1)  # tr(F)
+        first_chern_class = trace_F / (2 * math.pi * 1j)  # 复数形式
+        
+        # 第二陈类: c2 = (tr(F²) - tr(F)²) / (8π²)
+        F_squared = torch.bmm(curvature, curvature)
+        trace_F_squared = torch.diagonal(F_squared, dim1=-2, dim2=-1).sum(dim=-1)  # tr(F²)
+        
+        second_chern_class = (trace_F_squared - trace_F**2) / (8 * math.pi**2)
+        
+        return {
+            'first_chern_class': first_chern_class.real,  # 取实部
+            'second_chern_class': second_chern_class,
+            'trace_F': trace_F,
+            'trace_F_squared': trace_F_squared
+        }
+    
+    def compute_topological_invariants(self, x):
+        """计算拓扑不变量 - 修复版本"""
+        batch_size, n, d = x.shape
+        all_invariants = {'first_chern_class': [], 'second_chern_class': [], 
+                         'trace_F': [], 'trace_F_squared': []}
+        
+        for i in range(n):
+            x_slice = x[:, i:i+1, :]  # [batch_size, 1, d_model]
+            
+            connection = self.compute_connection_form(x_slice)
+            curvature = self.compute_curvature_form(connection)
+            chern_classes = self.compute_chern_class(curvature)
+            
+            all_invariants['first_chern_class'].append(chern_classes['first_chern_class'])
+            all_invariants['second_chern_class'].append(chern_classes['second_chern_class'])
+            all_invariants['trace_F'].append(chern_classes['trace_F'])
+            all_invariants['trace_F_squared'].append(chern_classes['trace_F_squared'])
+        
+        # 合并所有位置的结果
+        result = {}
+        for key in all_invariants:
+            if all_invariants[key]:  # 确保列表不为空
+                result[key] = torch.stack(all_invariants[key], dim=1)
+            else:
+                # 如果为空，创建适当形状的零张量
+                result[key] = torch.zeros(batch_size, n, dtype=torch.float32, device=x.device)
+        
+        return result
+    
+    def forward(self, x):
+        """x: [batch_size, vocab_size, d_model]"""
+        batch_size, n, d = x.shape
+        
+        # 保存输入用于陈类计算
+        self.activations['input'] = x.clone()
+        self.activations['input_topology'] = self.compute_topological_invariants(x)
+        
+        # 应用几何变换
+        x_flat = x.view(-1, d)
+        for i, layer in enumerate(self.geometric_layers):
+            x_flat = layer(x_flat)
+            layer_output = x_flat.view(batch_size, n, d)
+            
+            self.activations[f'layer{i+1}'] = layer_output.clone()
+            self.activations[f'layer{i+1}_topology'] = self.compute_topological_invariants(layer_output)
+        
+        x = x_flat.view(batch_size, n, d)
+        self.activations['output'] = x.clone()
+        self.activations['output_topology'] = self.compute_topological_invariants(x)
+        
+        return x
+
+class ChernClassAnalyzer:
+    """陈类分析器"""
+    def __init__(self, model):
+        self.model = model
+        self.chern_history = []
+    
+    def analyze_chern_classes(self):
+        """分析各层的陈类"""
+        topology_keys = [k for k in self.model.activations.keys() if 'topology' in k]
+        
+        chern_analysis = {}
+        
+        for key in topology_keys:
+            topo_info = self.model.activations[key]
+            
+            chern_analysis[key] = {
+                'first_chern_mean': torch.mean(topo_info['first_chern_class']).item(),
+                'first_chern_std': torch.std(topo_info['first_chern_class']).item(),
+                'second_chern_mean': torch.mean(topo_info['second_chern_class']).item(),
+                'second_chern_std': torch.std(topo_info['second_chern_class']).item(),
+                'trace_F_mean': torch.mean(topo_info['trace_F']).item(),
+                'trace_F_std': torch.std(topo_info['trace_F']).item()
+            }
+        
+        return chern_analysis
+    
+    def detect_topological_phase_transitions(self):
+        """检测拓扑相变（陈类的突变）"""
+        topology_keys = [k for k in self.model.activations.keys() if 'topology' in k]
+        
+        phase_transitions = []
+        
+        for i in range(len(topology_keys)-1):
+            current_key = topology_keys[i]
+            next_key = topology_keys[i+1]
+            
+            current_chern = self.model.activations[current_key]
+            next_chern = self.model.activations[next_key]
+            
+            # 计算陈类变化
+            first_chern_change = torch.mean(torch.abs(
+                torch.mean(current_chern['first_chern_class'], dim=[0,1]) - 
+                torch.mean(next_chern['first_chern_class'], dim=[0,1])
+            )).item()
+            
+            second_chern_change = torch.mean(torch.abs(
+                torch.mean(current_chern['second_chern_class'], dim=[0,1]) - 
+                torch.mean(next_chern['second_chern_class'], dim=[0,1])
+            )).item()
+            
+            # 如果陈类变化超过阈值，认为是拓扑相变
+            if first_chern_change > 0.1 or second_chern_change > 0.01:
+                phase_transitions.append({
+                    'transition': f"{current_key} -> {next_key}",
+                    'first_chern_change': first_chern_change,
+                    'second_chern_change': second_chern_change,
+                    'detected': True
+                })
+        
+        return phase_transitions
+
+def find_topological_phase_transition_thresholds():
+    """寻找拓扑相变的临界条件"""
+    print("🔍 寻找拓扑相变的临界条件...")
+    
+    # 模拟数据
+    batch_size = 1
+    vocab_size = 8
+    d_model = 16  # 减小维度以简化计算
+    
+    # 测试不同强度的异常
+    anomaly_strengths = np.logspace(0, 3, 20)  # 从1到1000，20个点
+    phase_transitions_count = []
+    chern_changes = []
+    
+    print("🧪 测试异常强度与拓扑相变的关系:")
+    
+    for i, strength in enumerate(anomaly_strengths):
+        model = CognitiveFiberBundle(vocab_size, d_model=d_model)
+        analyzer = ChernClassAnalyzer(model)
+        
+        # 创建异常输入，强度递增
+        inputs = torch.randn(batch_size, vocab_size, d_model)
+        inputs[0, 0, 0] = strength    # 递增异常值
+        inputs[0, 1, 0] = -strength  # 对应负值
+        
+        outputs = model(inputs)
+        chern_analysis = analyzer.analyze_chern_classes()
+        phase_transitions = analyzer.detect_topological_phase_transitions()
+        
+        # 计算第二陈类变化
+        chern_change = abs(chern_analysis['input_topology']['second_chern_mean'] - 
+                          chern_analysis['output_topology']['second_chern_mean'])
+        
+        phase_transitions_count.append(len(phase_transitions))
+        chern_changes.append(chern_change)
+        
+        if len(phase_transitions) > 0 or chern_change > 0.01:
+            print(f"  异常强度={strength:.1f}: 拓扑相变={len(phase_transitions)}个, 陈类变化={chern_change:.6f}")
+    
+    # 寻找临界点
+    critical_points = []
+    for i in range(1, len(phase_transitions_count)):
+        if phase_transitions_count[i] > phase_transitions_count[i-1] or chern_changes[i] > 0.01:
+            critical_points.append((anomaly_strengths[i], chern_changes[i], phase_transitions_count[i]))
+    
+    print(f"\n🎯 发现临界点: {len(critical_points)}个")
+    for i, (strength, chern_change, trans_count) in enumerate(critical_points):
+        print(f"  临界点{i+1}: 异常强度={strength:.1f}, 陈类变化={chern_change:.6f}, 拓扑相变={trans_count}个")
+    
+    # 测试不同类型的异常
+    print(f"\n🧪 测试不同类型的异常临界条件:")
+    
+    # 类型1: 单点异常
+    print("  1. 单点异常临界条件:")
+    single_anomaly_threshold = None
+    for strength in np.logspace(1, 4, 50):  # 从10到10000
+        model = CognitiveFiberBundle(vocab_size, d_model=d_model)
+        analyzer = ChernClassAnalyzer(model)
+        
+        inputs = torch.randn(batch_size, vocab_size, d_model)
+        inputs[0, 0, 0] = strength  # 单点异常
+        
+        outputs = model(inputs)
+        phase_transitions = analyzer.detect_topological_phase_transitions()
+        
+        if len(phase_transitions) > 0:
+            single_anomaly_threshold = strength
+            print(f"    临界强度: {strength:.1f}")
+            break
+    
+    # 类型2: 多点异常
+    print("  2. 多点异常临界条件:")
+    multi_anomaly_threshold = None
+    for strength in np.logspace(1, 4, 50):  # 从10到10000
+        model = CognitiveFiberBundle(vocab_size, d_model=d_model)
+        analyzer = ChernClassAnalyzer(model)
+        
+        inputs = torch.randn(batch_size, vocab_size, d_model)
+        inputs[0, :4, 0] = strength  # 多点异常
+        inputs[0, 4:, 0] = -strength  # 对应负值
+        
+        outputs = model(inputs)
+        phase_transitions = analyzer.detect_topological_phase_transitions()
+        
+        if len(phase_transitions) > 0:
+            multi_anomaly_threshold = strength
+            print(f"    临界强度: {strength:.1f}")
+            break
+    
+    # 类型3: 约束异常
+    print("  3. 约束异常临界条件:")
+    constraint_threshold = None
+    for strength in np.logspace(1, 4, 50):  # 从10到10000
+        model = CognitiveFiberBundle(vocab_size, d_model=d_model)
+        analyzer = ChernClassAnalyzer(model)
+        
+        inputs = torch.randn(batch_size, vocab_size, d_model)
+        inputs[0, 0, :] = torch.ones(d_model) * strength  # 一致性破坏
+        inputs[0, 1, :] = torch.ones(d_model) * -strength # 一致性破坏
+        
+        outputs = model(inputs)
+        phase_transitions = analyzer.detect_topological_phase_transitions()
+        
+        if len(phase_transitions) > 0:
+            constraint_threshold = strength
+            print(f"    临界强度: {strength:.1f}")
+            break
+    
+    # 可视化结果
+    fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+    axes = axes.flatten()
+    
+    # 异常强度 vs 拓扑相变数量
+    axes[0].semilogx(anomaly_strengths, phase_transitions_count, 'ro-', linewidth=2, markersize=6)
+    axes[0].set_title('异常强度 vs 拓扑相变数量', fontsize=12)
+    axes[0].set_xlabel('异常强度')
+    axes[0].set_ylabel('拓扑相变数量')
+    axes[0].grid(True, alpha=0.3)
+    
+    # 异常强度 vs 陈类变化
+    axes[1].semilogx(anomaly_strengths, chern_changes, 'bo-', linewidth=2, markersize=6)
+    axes[1].set_title('异常强度 vs 第二陈类变化', fontsize=12)
+    axes[1].set_xlabel('异常强度')
+    axes[1].set_ylabel('第二陈类变化量')
+    axes[1].grid(True, alpha=0.3)
+    
+    # 临界点标注
+    if critical_points:
+        critical_strengths = [pt[0] for pt in critical_points]
+        critical_changes = [pt[1] for pt in critical_points]
+        axes[1].scatter(critical_strengths, critical_changes, color='red', s=100, zorder=5, label='临界点')
+        axes[1].legend()
+    
+    # 不同异常类型的临界阈值对比
+    anomaly_types = ['单点异常', '多点异常', '约束异常']
+    thresholds = [single_anomaly_threshold or 0, multi_anomaly_threshold or 0, constraint_threshold or 0]
+    
+    bars = axes[2].bar(anomaly_types, thresholds, color=['red', 'orange', 'blue'], alpha=0.7)
+    axes[2].set_title('不同类型异常的临界阈值', fontsize=12)
+    axes[2].set_ylabel('临界异常强度')
+    axes[2].set_yscale('log')
+    
+    for bar, threshold in zip(bars, thresholds):
+        if threshold > 0:
+            axes[2].text(bar.get_x() + bar.get_width()/2., bar.get_height() * 1.1,
+                        f'{threshold:.1f}', ha='center', va='bottom', fontsize=10)
+    
+    # 拓扑相变机制示意图
+    axes[3].text(0.5, 0.7, '拓扑相变机制', horizontalalignment='center', 
+                verticalalignment='center', transform=axes[3].transAxes, fontsize=14, weight='bold')
+    axes[3].text(0.5, 0.5, '认知纤维丛 → 反身性自适应 → 拓扑韧性 → 临界相变', 
+                horizontalalignment='center', verticalalignment='center', 
+                transform=axes[3].transAxes, fontsize=12)
+    axes[3].text(0.5, 0.3, '临界阈值: 系统保护机制失效点', 
+                horizontalalignment='center', verticalalignment='center', 
+                transform=axes[3].transAxes, fontsize=10)
+    axes[3].set_xlim(0, 1)
+    axes[3].set_ylim(0, 1)
+    
+    plt.tight_layout()
+    plt.show()
+    
+    # 总结
+    print(f"\n📊 拓扑相变临界条件总结:")
+    print(f"  单点异常临界阈值: {single_anomaly_threshold or '未发现'}")
+    print(f"  多点异常临界阈值: {multi_anomaly_threshold or '未发现'}")
+    print(f"  约束异常临界阈值: {constraint_threshold or '未发现'}")
+    
+    if critical_points:
+        print(f"\n🎯 临界点分析:")
+        for i, (strength, chern_change, trans_count) in enumerate(critical_points):
+            print(f"  临界点{i+1}: 异常强度≥{strength:.1f}时发生拓扑相变")
+    
+    print(f"\n🎯 理论意义:")
+    print(f"  • 临界阈值 = 认知系统的拓扑保护极限")
+    print(f"  • 超过阈值 → 拓扑结构发生根本性改变")
+    print(f"  • 为AGI安全性提供理论边界")
+    
+    return {
+        'critical_points': critical_points,
+        'single_anomaly_threshold': single_anomaly_threshold,
+        'multi_anomaly_threshold': multi_anomaly_threshold,
+        'constraint_threshold': constraint_threshold,
+        'anomaly_strengths': anomaly_strengths,
+        'phase_transitions': phase_transitions_count,
+        'chern_changes': chern_changes
+    }
+
+# 运行拓扑相变临界条件测试
+if __name__ == "__main__":
+    results = find_topological_phase_transition_thresholds()
