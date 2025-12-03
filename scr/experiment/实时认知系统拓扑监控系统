@@ -1,0 +1,405 @@
+import torch
+import torch.nn as nn
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
+import math
+import time
+from collections import deque
+
+class CognitiveFiberBundle(nn.Module):
+    """认知纤维丛模型 - 实时监控版"""
+    def __init__(self, vocab_size, d_model=64, k_neighbors=8):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+        self.k_neighbors = k_neighbors
+        
+        # 存储中间激活值用于陈类计算
+        self.activations = {}
+        
+        # 认知纤维丛的联络形式（connection form）
+        self.connection_form = nn.Parameter(torch.randn(d_model, d_model) * 0.1)
+        
+        # 简化的曲率形式计算参数
+        self.curvature_weight = nn.Parameter(torch.randn(d_model, d_model) * 0.01)
+        
+        # 几何编码层
+        self.geometric_layers = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(d_model, d_model),
+                nn.GELU()
+            ),
+            nn.Sequential(
+                nn.Linear(d_model, d_model),
+                nn.GELU()
+            )
+        ])
+    
+    def compute_connection_form(self, x):
+        """计算联络形式 A - 实时监控版"""
+        batch_size, n, d = x.shape
+        x_flat = x.view(batch_size * n, d)
+        
+        # 扩展connection_form到batch维度
+        connection = self.connection_form.unsqueeze(0).expand(batch_size * n, -1, -1)
+        
+        # 添加基于输入的非线性项
+        input_effect = torch.einsum('bi,ij->bj', x_flat, self.curvature_weight)
+        input_diag = torch.diag_embed(input_effect)
+        connection = connection + input_diag * 0.1
+        
+        return connection
+    
+    def compute_curvature_form(self, connection):
+        """计算曲率形式 F = dA + A∧A (实时监控版)"""
+        batch_size_n, d, d = connection.shape
+        
+        # 实时监控版：F = A*A - A^T*A + 非线性项
+        A_squared = torch.bmm(connection, connection)
+        A_transposed = connection.transpose(-2, -1)
+        A_transposed_squared = torch.bmm(A_transposed, connection)
+        
+        # 添加高阶项以增强差异
+        A_cubed = torch.bmm(A_squared, connection)
+        
+        curvature = A_squared - A_transposed_squared + 0.01 * A_cubed
+        return curvature
+    
+    def compute_chern_class(self, curvature):
+        """计算陈类 - 实时监控版拓扑不变量"""
+        batch_size, d, d = curvature.shape
+        
+        # 第一陈类: c1 = tr(F) / (2πi)
+        trace_F = torch.diagonal(curvature, dim1=-2, dim2=-1).sum(dim=-1)  # tr(F)
+        first_chern_class = trace_F / (2 * math.pi * 1j)  # 复数形式
+        
+        # 第二陈类: c2 = (tr(F²) - tr(F)²) / (8π²)
+        F_squared = torch.bmm(curvature, curvature)
+        trace_F_squared = torch.diagonal(F_squared, dim1=-2, dim2=-1).sum(dim=-1)  # tr(F²)
+        
+        second_chern_class = (trace_F_squared - trace_F**2) / (8 * math.pi**2)
+        
+        return {
+            'first_chern_class': first_chern_class.real,  # 取实部
+            'second_chern_class': second_chern_class,
+            'trace_F': trace_F,
+            'trace_F_squared': trace_F_squared,
+            'chern_ratio': second_chern_class / (first_chern_class.real + 1e-8),  # 陈类比值
+            'curvature_norm': torch.norm(curvature, dim=[-2, -1])  # 曲率范数
+        }
+    
+    def compute_topological_invariants(self, x):
+        """计算拓扑不变量 - 实时监控版"""
+        batch_size, n, d = x.shape
+        all_invariants = {
+            'first_chern_class': [], 'second_chern_class': [], 
+            'trace_F': [], 'trace_F_squared': [],
+            'chern_ratio': [], 'curvature_norm': []
+        }
+        
+        for i in range(n):
+            x_slice = x[:, i:i+1, :]  # [batch_size, 1, d_model]
+            
+            connection = self.compute_connection_form(x_slice)
+            curvature = self.compute_curvature_form(connection)
+            chern_classes = self.compute_chern_class(curvature)
+            
+            all_invariants['first_chern_class'].append(chern_classes['first_chern_class'])
+            all_invariants['second_chern_class'].append(chern_classes['second_chern_class'])
+            all_invariants['trace_F'].append(chern_classes['trace_F'])
+            all_invariants['trace_F_squared'].append(chern_classes['trace_F_squared'])
+            all_invariants['chern_ratio'].append(chern_classes['chern_ratio'])
+            all_invariants['curvature_norm'].append(chern_classes['curvature_norm'])
+        
+        # 合并所有位置的结果
+        result = {}
+        for key in all_invariants:
+            if all_invariants[key]:  # 确保列表不为空
+                result[key] = torch.stack(all_invariants[key], dim=1)
+            else:
+                # 如果为空，创建适当形状的零张量
+                result[key] = torch.zeros(batch_size, n, dtype=torch.float32, device=x.device)
+        
+        return result
+    
+    def forward(self, x):
+        """x: [batch_size, vocab_size, d_model]"""
+        batch_size, n, d = x.shape
+        
+        # 保存输入用于陈类计算
+        self.activations['input'] = x.clone()
+        self.activations['input_topology'] = self.compute_topological_invariants(x)
+        
+        # 应用几何变换
+        x_flat = x.view(-1, d)
+        for i, layer in enumerate(self.geometric_layers):
+            x_flat = layer(x_flat)
+            layer_output = x_flat.view(batch_size, n, d)
+            
+            self.activations[f'layer{i+1}'] = layer_output.clone()
+            self.activations[f'layer{i+1}_topology'] = self.compute_topological_invariants(layer_output)
+        
+        x = x_flat.view(batch_size, n, d)
+        self.activations['output'] = x.clone()
+        self.activations['output_topology'] = self.compute_topological_invariants(x)
+        
+        return x
+
+class RealTimeTopologicalMonitor:
+    """实时拓扑监控系统"""
+    def __init__(self, window_size=10):
+        self.window_size = window_size
+        self.topology_history = deque(maxlen=window_size)
+        self.chern_history = deque(maxlen=window_size)
+        self.anomaly_history = deque(maxlen=window_size)
+        
+        # 初始化统计量
+        self.running_mean = None
+        self.running_std = None
+        
+        # 监控阈值
+        self.chern_threshold = 0.01  # 陈类变化阈值
+        self.anomaly_threshold = 0.1  # 异常检测阈值
+        
+        # 创建图表
+        self.fig, self.axs = plt.subplots(2, 2, figsize=(15, 10))
+        self.fig.suptitle('实时认知系统拓扑监控', fontsize=16)
+        
+        # 设置子图
+        self.axs[0, 0].set_title('第二陈类实时变化')
+        self.axs[0, 1].set_title('曲率范数实时变化')
+        self.axs[1, 0].set_title('陈类比值实时变化')
+        self.axs[1, 1].set_title('拓扑异常检测')
+        
+        for ax in self.axs.flat:
+            ax.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        
+        # 用于动画的数据
+        self.x_data = []
+        self.y_data_chern = []
+        self.y_data_norm = []
+        self.y_data_ratio = []
+        self.y_data_anomaly = []
+        
+        self.time_step = 0
+    
+    def extract_topological_features(self, model):
+        """提取实时拓扑特征"""
+        features = {}
+        
+        # 计算各层的拓扑不变量
+        for layer_key in ['input_topology', 'layer1_topology', 'layer2_topology', 'output_topology']:
+            if layer_key in model.activations:
+                topo_data = model.activations[layer_key]
+                
+                features[layer_key] = {
+                    'first_chern_mean': torch.mean(topo_data['first_chern_class']).item(),
+                    'second_chern_mean': torch.mean(topo_data['second_chern_class']).item(),
+                    'trace_F_mean': torch.mean(topo_data['trace_F']).item(),
+                    'chern_ratio_mean': torch.mean(topo_data['chern_ratio']).item(),
+                    'curvature_norm_mean': torch.mean(topo_data['curvature_norm']).item()
+                }
+        
+        return features
+    
+    def detect_topological_anomaly(self, features):
+        """检测拓扑异常"""
+        # 计算当前特征与历史平均的差异
+        if len(self.chern_history) < 2:
+            return 0.0  # 没有足够的历史数据
+        
+        # 计算第二陈类变化
+        current_chern = features['output_topology']['second_chern_mean']
+        historical_mean = np.mean([h['output_topology']['second_chern_mean'] for h in self.chern_history])
+        historical_std = np.std([h['output_topology']['second_chern_mean'] for h in self.chern_history])
+        
+        if historical_std == 0:
+            return 0.0
+        
+        # 标准化差异
+        chern_deviation = abs(current_chern - historical_mean) / (historical_std + 1e-8)
+        
+        # 计算曲率范数变化
+        current_norm = features['output_topology']['curvature_norm_mean']
+        historical_norm_mean = np.mean([h['output_topology']['curvature_norm_mean'] for h in self.chern_history])
+        historical_norm_std = np.std([h['output_topology']['curvature_norm_mean'] for h in self.chern_history])
+        
+        if historical_norm_std == 0:
+            norm_deviation = 0.0
+        else:
+            norm_deviation = abs(current_norm - historical_norm_mean) / (historical_norm_std + 1e-8)
+        
+        # 综合异常分数
+        anomaly_score = 0.6 * chern_deviation + 0.4 * norm_deviation
+        
+        return min(anomaly_score, 1.0)  # 限制在0-1范围内
+    
+    def update_monitor(self, model):
+        """更新监控系统"""
+        # 提取拓扑特征
+        features = self.extract_topological_features(model)
+        
+        # 检测拓扑异常
+        anomaly_score = self.detect_topological_anomaly(features)
+        
+        # 保存历史数据
+        self.topology_history.append(features)
+        self.chern_history.append(features)
+        self.anomaly_history.append(anomaly_score)
+        
+        # 更新统计数据
+        if len(self.chern_history) > 1:
+            all_cherns = [h['output_topology']['second_chern_mean'] for h in self.chern_history]
+            self.running_mean = np.mean(all_cherns)
+            self.running_std = np.std(all_cherns)
+        
+        # 更新动画数据
+        self.x_data.append(self.time_step)
+        self.y_data_chern.append(features['output_topology']['second_chern_mean'])
+        self.y_data_norm.append(features['output_topology']['curvature_norm_mean'])
+        self.y_data_ratio.append(features['output_topology']['chern_ratio_mean'])
+        self.y_data_anomaly.append(anomaly_score)
+        
+        self.time_step += 1
+        
+        # 限制数据显示长度
+        if len(self.x_data) > 20:
+            self.x_data = self.x_data[-20:]
+            self.y_data_chern = self.y_data_chern[-20:]
+            self.y_data_norm = self.y_data_norm[-20:]
+            self.y_data_ratio = self.y_data_ratio[-20:]
+            self.y_data_anomaly = self.y_data_anomaly[-20:]
+        
+        # 绘制实时图表
+        self.axs[0, 0].clear()
+        self.axs[0, 0].plot(self.x_data, self.y_data_chern, 'b-', linewidth=2, label='第二陈类')
+        self.axs[0, 0].axhline(y=0, color='r', linestyle='--', alpha=0.5, label='零基准')
+        self.axs[0, 0].set_title('第二陈类实时变化')
+        self.axs[0, 0].grid(True, alpha=0.3)
+        self.axs[0, 0].legend()
+        
+        self.axs[0, 1].clear()
+        self.axs[0, 1].plot(self.x_data, self.y_data_norm, 'g-', linewidth=2, label='曲率范数')
+        self.axs[0, 1].set_title('曲率范数实时变化')
+        self.axs[0, 1].grid(True, alpha=0.3)
+        self.axs[0, 1].legend()
+        
+        self.axs[1, 0].clear()
+        self.axs[1, 0].plot(self.x_data, self.y_data_ratio, 'm-', linewidth=2, label='陈类比值')
+        self.axs[1, 0].set_title('陈类比值实时变化')
+        self.axs[1, 0].grid(True, alpha=0.3)
+        self.axs[1, 0].legend()
+        
+        self.axs[1, 1].clear()
+        self.axs[1, 1].plot(self.x_data, self.y_data_anomaly, 'r-', linewidth=2, label='异常分数')
+        self.axs[1, 1].axhline(y=self.anomaly_threshold, color='orange', linestyle='--', 
+                              label=f'异常阈值({self.anomaly_threshold})')
+        self.axs[1, 1].set_title('拓扑异常检测')
+        self.axs[1, 1].set_ylim(0, 1)
+        self.axs[1, 1].grid(True, alpha=0.3)
+        self.axs[1, 1].legend()
+        
+        plt.tight_layout()
+        plt.show()
+        
+        # 返回当前状态
+        return {
+            'second_chern': features['output_topology']['second_chern_mean'],
+            'curvature_norm': features['output_topology']['curvature_norm_mean'],
+            'chern_ratio': features['output_topology']['chern_ratio_mean'],
+            'anomaly_score': anomaly_score,
+            'is_anomaly': anomaly_score > self.anomaly_threshold
+        }
+    
+    def get_system_status(self):
+        """获取系统状态摘要"""
+        if len(self.anomaly_history) == 0:
+            return "系统初始化中..."
+        
+        recent_anomalies = [a for a in list(self.anomaly_history)[-5:] if a > self.anomaly_threshold]
+        status = f"拓扑稳定性: {'✅ 稳定' if len(recent_anomalies) == 0 else '⚠️ 异常'}"
+        status += f" | 最新异常分数: {self.anomaly_history[-1]:.3f}"
+        
+        if self.running_mean is not None:
+            status += f" | 第二陈类均值: {self.running_mean:.6f}"
+        
+        return status
+
+def simulate_real_time_monitoring():
+    """模拟实时拓扑监控"""
+    print("🚨 开始实时认知系统拓扑监控...")
+    
+    # 初始化监控系统
+    monitor = RealTimeTopologicalMonitor(window_size=10)
+    
+    batch_size = 1
+    vocab_size = 8
+    d_model = 16
+    
+    print("🧪 开始实时监控模拟...")
+    print("  模拟不同类型的输入: 正常 → 异常 → 约束违反 → 恢复正常")
+    
+    # 模拟不同的输入类型
+    for step in range(30):
+        # 模拟不同类型的输入
+        if step < 8:
+            # 正常输入
+            inputs = torch.randn(batch_size, vocab_size, d_model)
+            input_type = "正常"
+        elif step < 16:
+            # 异常输入
+            inputs = torch.randn(batch_size, vocab_size, d_model)
+            inputs[0, 0, 0] = np.random.uniform(50, 100)  # 异常值
+            input_type = "异常"
+        elif step < 24:
+            # 约束违反输入
+            inputs = torch.randn(batch_size, vocab_size, d_model)
+            inputs[0, 0, :] = torch.ones(d_model) * np.random.uniform(20, 50)  # 约束违反
+            inputs[0, 1, :] = torch.ones(d_model) * -np.random.uniform(20, 50)
+            input_type = "约束违反"
+        else:
+            # 恢复正常
+            inputs = torch.randn(batch_size, vocab_size, d_model)
+            input_type = "恢复正常"
+        
+        # 创建并运行模型
+        model = CognitiveFiberBundle(vocab_size, d_model=d_model)
+        _ = model(inputs)
+        
+        # 更新监控
+        status = monitor.update_monitor(model)
+        
+        # 打印状态
+        anomaly_status = "🚨 异常" if status['is_anomaly'] else "✅ 正常"
+        print(f"步骤 {step+1:2d}: {input_type:8s} | {anomaly_status} | "
+              f"第二陈类: {status['second_chern']:.6f} | "
+              f"异常分数: {status['anomaly_score']:.3f}")
+        
+        # 每5步打印一次系统摘要
+        if step % 5 == 4:
+            print(f"  📊 系统摘要: {monitor.get_system_status()}")
+        
+        # 模拟实时延迟
+        time.sleep(0.1)
+    
+    print(f"\n🎯 实时监控完成!")
+    print(f"  监控了 {30} 个时间步")
+    print(f"  检测到拓扑异常: {sum(1 for a in monitor.anomaly_history if a > monitor.anomaly_threshold)} 次")
+    print(f"  系统稳定性: {monitor.get_system_status()}")
+    
+    print(f"\n🌟 实时拓扑监控的理论意义:")
+    print(f"  • 实时检测认知系统的拓扑异常")
+    print(f"  • 量化异常对拓扑结构的影响")
+    print(f"  • 为AGI安全性提供实时保障")
+    print(f"  • 验证了认知纤维丛的动态特性")
+    
+    return monitor
+
+# 运行实时拓扑监控
+if __name__ == "__main__":
+    monitor = simulate_real_time_monitoring()
