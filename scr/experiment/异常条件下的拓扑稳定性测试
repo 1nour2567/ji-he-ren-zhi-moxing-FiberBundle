@@ -1,0 +1,377 @@
+import torch
+import torch.nn as nn
+import numpy as np
+import matplotlib.pyplot as plt
+import math
+
+class CognitiveFiberBundle(nn.Module):
+    """认知纤维丛模型 - 陈类计算的最终实现"""
+    def __init__(self, vocab_size, d_model=64, k_neighbors=8):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+        self.k_neighbors = k_neighbors
+        
+        # 存储中间激活值用于陈类计算
+        self.activations = {}
+        
+        # 认知纤维丛的联络形式（connection form）
+        self.connection_form = nn.Parameter(torch.randn(d_model, d_model) * 0.1)
+        
+        # 简化的曲率形式计算参数
+        self.curvature_weight = nn.Parameter(torch.randn(d_model, d_model) * 0.01)
+        
+        # 几何编码层
+        self.geometric_layers = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(d_model, d_model),
+                nn.GELU()
+            ),
+            nn.Sequential(
+                nn.Linear(d_model, d_model),
+                nn.GELU()
+            )
+        ])
+    
+    def compute_connection_form(self, x):
+        """计算联络形式 A - 修复版本"""
+        batch_size, n, d = x.shape
+        x_flat = x.view(batch_size * n, d)
+        
+        # 扩展connection_form到batch维度
+        connection = self.connection_form.unsqueeze(0).expand(batch_size * n, -1, -1)
+        
+        # 简化：为每个位置添加基于输入的对角扰动
+        input_diag = torch.diag_embed(torch.mean(x_flat, dim=1, keepdim=True).expand(-1, d) * 0.01)
+        connection = connection + input_diag
+        
+        return connection
+    
+    def compute_curvature_form(self, connection):
+        """计算曲率形式 F = dA + A∧A (简化版本)"""
+        batch_size_n, d, d = connection.shape
+        
+        # 简化版本：F = A*A - A^T*A (李括号的对角占优近似)
+        A_squared = torch.bmm(connection, connection)
+        A_transposed = connection.transpose(-2, -1)
+        A_transposed_squared = torch.bmm(A_transposed, connection)
+        
+        curvature = A_squared - A_transposed_squared
+        return curvature
+    
+    def compute_chern_class(self, curvature):
+        """计算陈类 - 拓扑不变量"""
+        batch_size, d, d = curvature.shape
+        
+        # 第一陈类: c1 = tr(F) / (2πi)
+        trace_F = torch.diagonal(curvature, dim1=-2, dim2=-1).sum(dim=-1)  # tr(F)
+        first_chern_class = trace_F / (2 * math.pi * 1j)  # 复数形式
+        
+        # 第二陈类: c2 = (tr(F²) - tr(F)²) / (8π²)
+        F_squared = torch.bmm(curvature, curvature)
+        trace_F_squared = torch.diagonal(F_squared, dim1=-2, dim2=-1).sum(dim=-1)  # tr(F²)
+        
+        second_chern_class = (trace_F_squared - trace_F**2) / (8 * math.pi**2)
+        
+        return {
+            'first_chern_class': first_chern_class.real,  # 取实部
+            'second_chern_class': second_chern_class,
+            'trace_F': trace_F,
+            'trace_F_squared': trace_F_squared
+        }
+    
+    def compute_topological_invariants(self, x):
+        """计算拓扑不变量 - 修复版本"""
+        batch_size, n, d = x.shape
+        all_invariants = {'first_chern_class': [], 'second_chern_class': [], 
+                         'trace_F': [], 'trace_F_squared': []}
+        
+        for i in range(n):
+            x_slice = x[:, i:i+1, :]  # [batch_size, 1, d_model]
+            
+            connection = self.compute_connection_form(x_slice)
+            curvature = self.compute_curvature_form(connection)
+            chern_classes = self.compute_chern_class(curvature)
+            
+            all_invariants['first_chern_class'].append(chern_classes['first_chern_class'])
+            all_invariants['second_chern_class'].append(chern_classes['second_chern_class'])
+            all_invariants['trace_F'].append(chern_classes['trace_F'])
+            all_invariants['trace_F_squared'].append(chern_classes['trace_F_squared'])
+        
+        # 合并所有位置的结果
+        result = {}
+        for key in all_invariants:
+            if all_invariants[key]:  # 确保列表不为空
+                result[key] = torch.stack(all_invariants[key], dim=1)
+            else:
+                # 如果为空，创建适当形状的零张量
+                result[key] = torch.zeros(batch_size, n, dtype=torch.float32, device=x.device)
+        
+        return result
+    
+    def forward(self, x):
+        """x: [batch_size, vocab_size, d_model]"""
+        batch_size, n, d = x.shape
+        
+        # 保存输入用于陈类计算
+        self.activations['input'] = x.clone()
+        self.activations['input_topology'] = self.compute_topological_invariants(x)
+        
+        # 应用几何变换
+        x_flat = x.view(-1, d)
+        for i, layer in enumerate(self.geometric_layers):
+            x_flat = layer(x_flat)
+            layer_output = x_flat.view(batch_size, n, d)
+            
+            self.activations[f'layer{i+1}'] = layer_output.clone()
+            self.activations[f'layer{i+1}_topology'] = self.compute_topological_invariants(layer_output)
+        
+        x = x_flat.view(batch_size, n, d)
+        self.activations['output'] = x.clone()
+        self.activations['output_topology'] = self.compute_topological_invariants(x)
+        
+        return x
+
+class ChernClassAnalyzer:
+    """陈类分析器"""
+    def __init__(self, model):
+        self.model = model
+        self.chern_history = []
+    
+    def analyze_chern_classes(self):
+        """分析各层的陈类"""
+        topology_keys = [k for k in self.model.activations.keys() if 'topology' in k]
+        
+        chern_analysis = {}
+        
+        for key in topology_keys:
+            topo_info = self.model.activations[key]
+            
+            chern_analysis[key] = {
+                'first_chern_mean': torch.mean(topo_info['first_chern_class']).item(),
+                'first_chern_std': torch.std(topo_info['first_chern_class']).item(),
+                'second_chern_mean': torch.mean(topo_info['second_chern_class']).item(),
+                'second_chern_std': torch.std(topo_info['second_chern_class']).item(),
+                'trace_F_mean': torch.mean(topo_info['trace_F']).item(),
+                'trace_F_std': torch.std(topo_info['trace_F']).item()
+            }
+        
+        return chern_analysis
+    
+    def detect_topological_phase_transitions(self):
+        """检测拓扑相变（陈类的突变）"""
+        topology_keys = [k for k in self.model.activations.keys() if 'topology' in k]
+        
+        phase_transitions = []
+        
+        for i in range(len(topology_keys)-1):
+            current_key = topology_keys[i]
+            next_key = topology_keys[i+1]
+            
+            current_chern = self.model.activations[current_key]
+            next_chern = self.model.activations[next_key]
+            
+            # 计算陈类变化
+            first_chern_change = torch.mean(torch.abs(
+                torch.mean(current_chern['first_chern_class'], dim=[0,1]) - 
+                torch.mean(next_chern['first_chern_class'], dim=[0,1])
+            )).item()
+            
+            second_chern_change = torch.mean(torch.abs(
+                torch.mean(current_chern['second_chern_class'], dim=[0,1]) - 
+                torch.mean(next_chern['second_chern_class'], dim=[0,1])
+            )).item()
+            
+            # 如果陈类变化超过阈值，认为是拓扑相变
+            if first_chern_change > 0.1 or second_chern_change > 0.01:
+                phase_transitions.append({
+                    'transition': f"{current_key} -> {next_key}",
+                    'first_chern_change': first_chern_change,
+                    'second_chern_change': second_chern_change,
+                    'detected': True
+                })
+        
+        return phase_transitions
+
+def test_topological_stability_under_anomalies():
+    """测试异常条件下的拓扑稳定性"""
+    # 模拟数据
+    batch_size = 1
+    vocab_size = 8
+    d_model = 16  # 减小维度以简化计算
+    
+    print("🧪 开始测试异常条件下的拓扑稳定性...")
+    
+    # 测试1: 正常条件（作为基准）
+    print("\n📋 基准测试 - 正常输入:")
+    model_normal = CognitiveFiberBundle(vocab_size, d_model=d_model)
+    analyzer_normal = ChernClassAnalyzer(model_normal)
+    
+    inputs_normal = torch.randn(batch_size, vocab_size, d_model)
+    outputs_normal = model_normal(inputs_normal)
+    chern_analysis_normal = analyzer_normal.analyze_chern_classes()
+    phase_transitions_normal = analyzer_normal.detect_topological_phase_transitions()
+    
+    print(f"  第二陈类变化: {abs(chern_analysis_normal['input_topology']['second_chern_mean'] - chern_analysis_normal['output_topology']['second_chern_mean']):.6f}")
+    print(f"  检测到拓扑相变: {len(phase_transitions_normal)}个")
+    
+    # 测试2: 高异常值输入
+    print("\n⚠️ 测试2 - 高异常值输入:")
+    model_anomaly = CognitiveFiberBundle(vocab_size, d_model=d_model)
+    analyzer_anomaly = ChernClassAnalyzer(model_anomaly)
+    
+    inputs_anomaly = torch.randn(batch_size, vocab_size, d_model)
+    # 添加异常值
+    inputs_anomaly[0, 0, 0] = 100.0    # 极大异常值
+    inputs_anomaly[0, 1, 5] = -100.0   # 极小异常值
+    inputs_anomaly[0, 2, 10] = 50.0    # 中等异常值
+    
+    print(f"  异常值位置和大小: (0,0,0)={inputs_anomaly[0, 0, 0].item():.1f}, (0,1,5)={inputs_anomaly[0, 1, 5].item():.1f}, (0,2,10)={inputs_anomaly[0, 2, 10].item():.1f}")
+    
+    outputs_anomaly = model_anomaly(inputs_anomaly)
+    chern_analysis_anomaly = analyzer_anomaly.analyze_chern_classes()
+    phase_transitions_anomaly = analyzer_anomaly.detect_topological_phase_transitions()
+    
+    print(f"  第二陈类变化: {abs(chern_analysis_anomaly['input_topology']['second_chern_mean'] - chern_analysis_anomaly['output_topology']['second_chern_mean']):.6f}")
+    print(f"  检测到拓扑相变: {len(phase_transitions_anomaly)}个")
+    
+    # 测试3: 拓扑结构异常（高连接性破坏）
+    print("\n⚠️ 测试3 - 拓扑结构异常输入:")
+    model_topology = CognitiveFiberBundle(vocab_size, d_model=d_model)
+    analyzer_topology = ChernClassAnalyzer(model_topology)
+    
+    inputs_topology = torch.randn(batch_size, vocab_size, d_model)
+    # 创建拓扑异常：极端值模式
+    inputs_topology[0, :4, :] = 20.0   # 前4个位置高激活
+    inputs_topology[0, 4:, :] = -20.0  # 后4个位置负激活
+    
+    print(f"  拓扑异常模式: 前4位置={torch.mean(inputs_topology[0, :4, :]).item():.2f}, 后4位置={torch.mean(inputs_topology[0, 4:, :]).item():.2f}")
+    
+    outputs_topology = model_topology(inputs_topology)
+    chern_analysis_topology = analyzer_topology.analyze_chern_classes()
+    phase_transitions_topology = analyzer_topology.detect_topological_phase_transitions()
+    
+    print(f"  第二陈类变化: {abs(chern_analysis_topology['input_topology']['second_chern_mean'] - chern_analysis_topology['output_topology']['second_chern_mean']):.6f}")
+    print(f"  检测到拓扑相变: {len(phase_transitions_topology)}个")
+    
+    # 测试4: 约束违反异常
+    print("\n⚠️ 测试4 - 约束违反异常输入:")
+    model_constraint = CognitiveFiberBundle(vocab_size, d_model=d_model)
+    analyzer_constraint = ChernClassAnalyzer(model_constraint)
+    
+    inputs_constraint = torch.randn(batch_size, vocab_size, d_model)
+    # 创建约束违反：破坏一致性
+    inputs_constraint[0, 0, :] = torch.ones(d_model) * 10  # 一致性破坏
+    inputs_constraint[0, 1, :] = torch.ones(d_model) * -10 # 一致性破坏
+    inputs_constraint[0, 2, :] = torch.ones(d_model) * 5   # 传递性破坏
+    
+    print(f"  约束异常模式: 位置0={torch.mean(inputs_constraint[0, 0, :]).item():.2f}, 位置1={torch.mean(inputs_constraint[0, 1, :]).item():.2f}, 位置2={torch.mean(inputs_constraint[0, 2, :]).item():.2f}")
+    
+    outputs_constraint = model_constraint(inputs_constraint)
+    chern_analysis_constraint = analyzer_constraint.analyze_chern_classes()
+    phase_transitions_constraint = analyzer_constraint.detect_topological_phase_transitions()
+    
+    print(f"  第二陈类变化: {abs(chern_analysis_constraint['input_topology']['second_chern_mean'] - chern_analysis_constraint['output_topology']['second_chern_mean']):.6f}")
+    print(f"  检测到拓扑相变: {len(phase_transitions_constraint)}个")
+    
+    # 结果汇总
+    print(f"\n📊 异常条件下的拓扑稳定性测试结果:")
+    print(f"  正常输入: 第二陈类变化={abs(chern_analysis_normal['input_topology']['second_chern_mean'] - chern_analysis_normal['output_topology']['second_chern_mean']):.6f}, 拓扑相变={len(phase_transitions_normal)}个")
+    print(f"  高异常值: 第二陈类变化={abs(chern_analysis_anomaly['input_topology']['second_chern_mean'] - chern_analysis_anomaly['output_topology']['second_chern_mean']):.6f}, 拓扑相变={len(phase_transitions_anomaly)}个")
+    print(f"  拓扑异常: 第二陈类变化={abs(chern_analysis_topology['input_topology']['second_chern_mean'] - chern_analysis_topology['output_topology']['second_chern_mean']):.6f}, 拓扑相变={len(phase_transitions_topology)}个")
+    print(f"  约束异常: 第二陈类变化={abs(chern_analysis_constraint['input_topology']['second_chern_mean'] - chern_analysis_constraint['output_topology']['second_chern_mean']):.6f}, 拓扑相变={len(phase_transitions_constraint)}个")
+    
+    # 可视化
+    fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+    axes = axes.flatten()
+    
+    # 第二陈类变化对比
+    test_names = ['正常输入', '高异常值', '拓扑异常', '约束异常']
+    chern_changes = [
+        abs(chern_analysis_normal['input_topology']['second_chern_mean'] - chern_analysis_normal['output_topology']['second_chern_mean']),
+        abs(chern_analysis_anomaly['input_topology']['second_chern_mean'] - chern_analysis_anomaly['output_topology']['second_chern_mean']),
+        abs(chern_analysis_topology['input_topology']['second_chern_mean'] - chern_analysis_topology['output_topology']['second_chern_mean']),
+        abs(chern_analysis_constraint['input_topology']['second_chern_mean'] - chern_analysis_constraint['output_topology']['second_chern_mean'])
+    ]
+    
+    axes[0].bar(test_names, chern_changes, color=['green', 'orange', 'red', 'purple'], alpha=0.7)
+    axes[0].set_title('第二陈类变化对比', fontsize=12)
+    axes[0].set_ylabel('第二陈类变化量')
+    axes[0].tick_params(axis='x', rotation=45)
+    
+    # 拓扑相变数量对比
+    phase_transitions_counts = [
+        len(phase_transitions_normal),
+        len(phase_transitions_anomaly),
+        len(phase_transitions_topology),
+        len(phase_transitions_constraint)
+    ]
+    
+    axes[1].bar(test_names, phase_transitions_counts, color=['green', 'orange', 'red', 'purple'], alpha=0.7)
+    axes[1].set_title('检测到的拓扑相变数量', fontsize=12)
+    axes[1].set_ylabel('拓扑相变数量')
+    axes[1].tick_params(axis='x', rotation=45)
+    
+    # 各测试的陈类分布
+    all_chern_data = [
+        model_normal.activations['input_topology']['second_chern_class'].detach().numpy().flatten(),
+        model_anomaly.activations['input_topology']['second_chern_class'].detach().numpy().flatten(),
+        model_topology.activations['input_topology']['second_chern_class'].detach().numpy().flatten(),
+        model_constraint.activations['input_topology']['second_chern_class'].detach().numpy().flatten()
+    ]
+    
+    colors = ['green', 'orange', 'red', 'purple']
+    for i, (data, name, color) in enumerate(zip(all_chern_data, test_names, colors)):
+        axes[2].hist(data, bins=15, alpha=0.5, label=name, color=color)
+    axes[2].set_title('各测试输入的第二陈类分布', fontsize=12)
+    axes[2].set_xlabel('第二陈类值')
+    axes[2].set_ylabel('频次')
+    axes[2].legend()
+    
+    # 输出层陈类对比
+    output_chern_data = [
+        model_normal.activations['output_topology']['second_chern_class'].detach().numpy().flatten(),
+        model_anomaly.activations['output_topology']['second_chern_class'].detach().numpy().flatten(),
+        model_topology.activations['output_topology']['second_chern_class'].detach().numpy().flatten(),
+        model_constraint.activations['output_topology']['second_chern_class'].detach().numpy().flatten()
+    ]
+    
+    for i, (data, name, color) in enumerate(zip(output_chern_data, test_names, colors)):
+        axes[3].hist(data, bins=15, alpha=0.5, label=name, color=color)
+    axes[3].set_title('各测试输出的第二陈类分布', fontsize=12)
+    axes[3].set_xlabel('第二陈类值')
+    axes[3].set_ylabel('频次')
+    axes[3].legend()
+    
+    plt.tight_layout()
+    plt.show()
+    
+    # 稳定性评估
+    print(f"\n🎯 拓扑稳定性评估:")
+    stable_tests = 0
+    for i, (change, trans) in enumerate(zip(chern_changes, phase_transitions_counts)):
+        is_stable = change < 0.01 and trans == 0
+        status = "✅ 稳定" if is_stable else "⚠️ 不稳定"
+        print(f"  {test_names[i]}: {status} (变化:{change:.6f}, 相变:{trans}个)")
+        if is_stable:
+            stable_tests += 1
+    
+    overall_stability = f"✅ 高稳定性 ({stable_tests}/4稳定)" if stable_tests >= 3 else f"⚠️ 部分稳定性 ({stable_tests}/4稳定)"
+    print(f"\n📈 总体稳定性: {overall_stability}")
+    
+    return {
+        'normal': chern_analysis_normal,
+        'anomaly': chern_analysis_anomaly,
+        'topology': chern_analysis_topology,
+        'constraint': chern_analysis_constraint,
+        'phase_transitions': {
+            'normal': len(phase_transitions_normal),
+            'anomaly': len(phase_transitions_anomaly),
+            'topology': len(phase_transitions_topology),
+            'constraint': len(phase_transitions_constraint)
+        }
+    }
+
+# 运行异常条件测试
+if __name__ == "__main__":
+    results = test_topological_stability_under_anomalies()
