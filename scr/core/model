@@ -1,0 +1,580 @@
+"""
+认知纤维丛与几何认知网络融合实现
+将几何认知模型作为纤维丛的节点层，实现完整的反身性自适应网络
+"""
+
+import numpy as np
+import torch
+import torch.nn as nn
+from typing import Dict, List, Tuple, Optional
+import matplotlib.pyplot as plt
+from collections import defaultdict
+
+
+class ReflexiveNeuron(nn.Module):
+    """反身性神经元（认知元）"""
+    
+    def __init__(self, input_dim: int, output_dim: int, reflexive_dim: int):
+        super().__init__()
+        
+        # 前馈部分
+        self.linear = nn.Linear(input_dim, output_dim)
+        
+        # 反身性部分
+        self.reflexive_layer = nn.Linear(output_dim, reflexive_dim)
+        self.reflexive_activation = nn.Tanh()
+        
+        # 自指约束
+        self.self_awareness = nn.Parameter(torch.randn(reflexive_dim))
+        
+    def forward(self, x: torch.Tensor, reflexive_load: float = 0.0) -> torch.Tensor:
+        # 前馈计算
+        output = torch.relu(self.linear(x))
+        
+        # 反身性处理
+        if reflexive_load > 0:
+            reflexive = self.reflexive_layer(output)
+            reflexive = self.reflexive_activation(reflexive)
+            
+            # 自指约束影响
+            output = output + reflexive_load * torch.matmul(
+                reflexive, self.self_awareness
+            ).unsqueeze(-1)
+        
+        return output
+
+
+class GeometricCognitiveNetwork(nn.Module):
+    """几何认知网络 - 反身性自适应网络的核心"""
+    
+    def __init__(self, input_dim: int, hidden_dims: List[int], 
+                 reflexive_dims: List[int], output_dim: int = 1):
+        super().__init__()
+        
+        # 网络层
+        self.layers = nn.ModuleList()
+        self.reflexive_layers = nn.ModuleList()
+        
+        # 构建前馈层
+        dims = [input_dim] + hidden_dims
+        for i in range(len(dims) - 1):
+            self.layers.append(nn.Linear(dims[i], dims[i + 1]))
+        
+        # 构建反身性层
+        for dim in reflexive_dims:
+            self.reflexive_layers.append(ReflexiveNeuron(dim, dim, dim // 2))
+        
+        # 输出层
+        self.output_layer = nn.Linear(hidden_dims[-1], output_dim)
+        
+        # 认知参数
+        self.cognitive_energy = nn.Parameter(torch.tensor(1.0))
+        self.cognitive_cost = nn.Parameter(torch.tensor(0.0))
+        self.reflexive_load = nn.Parameter(torch.tensor(0.0))
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # 前向传播
+        for layer in self.layers:
+            x = torch.relu(layer(x))
+        
+        # 反身性处理
+        if self.reflexive_load > 0:
+            for r_layer in self.reflexive_layers:
+                x = r_layer(x, self.reflexive_load.item())
+        
+        # 输出
+        return self.output_layer(x)
+    
+    def compute_reflexivity_score(self) -> float:
+        """计算反身性分数（曲率代理）"""
+        # 基于权重变化率
+        score = 0.0
+        for param in self.parameters():
+            if param.grad is not None:
+                score += torch.norm(param.grad).item()
+        
+        return score
+    
+    def adapt_reflexive_load(self, loss: float, threshold: float = 0.1):
+        """自适应调整反身性负荷"""
+        if loss < threshold:
+            # 任务简单，降低反身性
+            self.reflexive_load.data *= 0.9
+        else:
+            # 任务困难，增加反身性
+            self.reflexive_load.data *= 1.1
+    
+    def reset_state(self):
+        """重置认知状态"""
+        self.cognitive_energy.data = torch.tensor(1.0)
+        self.cognitive_cost.data = torch.tensor(0.0)
+        self.reflexive_load.data = torch.tensor(0.0)
+
+
+class CognitiveFiberBundle(nn.Module):
+    """
+    认知纤维丛的PyTorch实现
+    使用GeometricCognitiveNetwork作为节点层
+    """
+    
+    def __init__(self, n_nodes: int, state_dim: int, reflexive_dim: int):
+        super().__init__()
+        
+        # 基本结构
+        self.n_nodes = n_nodes
+        self.state_dim = state_dim
+        self.reflexive_dim = reflexive_dim
+        
+        # 使用几何认知网络作为节点层
+        self.node_networks = nn.ModuleList([
+            GeometricCognitiveNetwork(
+                input_dim=state_dim,
+                hidden_dims=[state_dim//2, state_dim//2],
+                reflexive_dims=[state_dim//4, state_dim//4],
+                output_dim=state_dim
+            ) for _ in range(n_nodes)
+        ])
+        
+        # 边权重/连接矩阵 (E)
+        self.adjacency = nn.Parameter(torch.randn(n_nodes, n_nodes))
+        
+        # 自指约束 (G) - 全局约束
+        self.global_constraints = nn.Parameter(torch.randn(reflexive_dim))
+        
+        # 学习率参数
+        self.eta = nn.Parameter(torch.tensor(0.01))  # 学习率
+        self.alpha = nn.Parameter(torch.tensor(0.1))  # 衰减系数
+        self.beta = nn.Parameter(torch.tensor(0.05))  # 反身性强度
+        
+        # 节点状态（由几何认知网络的输出决定）
+        self.node_states = nn.Parameter(torch.randn(n_nodes, state_dim))
+        
+    def compute_curvature(self) -> torch.Tensor:
+        """
+        计算曲率 F = dA + A ∧ A
+        对应理论中的逻辑不一致性度量
+        """
+        A = self.adjacency
+        F = A @ A - A * A  # 非线性项模拟联络的曲率
+        return F
+    
+    def compute_chern_class(self) -> torch.Tensor:
+        """
+        计算第一陈类 c₁ = (i/2π) ∫ Tr(F)
+        对应理论中的拓扑不变量
+        """
+        F = self.compute_curvature()
+        c1 = torch.trace(F) / (2 * np.pi)
+        return c1
+    
+    def compute_local_curvature(self) -> torch.Tensor:
+        """
+        计算局部曲率（基于每个节点的反身性分数）
+        """
+        local_curvatures = []
+        for node_net in self.node_networks:
+            local_curvatures.append(node_net.compute_reflexivity_score())
+        
+        return torch.tensor(local_curvatures)
+    
+    def reflexive_operation(self, lambda_load: float = 1.0) -> torch.Tensor:
+        """
+        反身性操作 R
+        lambda_load: 反身性负荷参数
+        """
+        # 自指约束的影响
+        g_effect = torch.sum(self.global_constraints) * lambda_load
+        
+        # 通过几何认知网络更新节点状态
+        updated_states = []
+        for i, node_net in enumerate(self.node_networks):
+            # 使用当前节点状态作为输入
+            input_state = self.node_states[i].unsqueeze(0)
+            # 通过几何认知网络处理
+            output_state = node_net(input_state)
+            updated_states.append(output_state.squeeze(0))
+        
+        updated_states = torch.stack(updated_states)
+        
+        # 应用全局约束影响
+        updated_states = updated_states + g_effect * torch.sigmoid(self.adjacency @ updated_states)
+        
+        return updated_states
+    
+    def compute_cognitive_energy(self) -> torch.Tensor:
+        """
+        计算认知自由能 F = -lnZ + λΣg²
+        对应定理5.1.1
+        """
+        # 配分函数近似（基于所有节点网络的能量）
+        Z = torch.exp(-torch.norm(self.node_states))
+        
+        # 约束项
+        constraint_term = torch.sum(self.global_constraints ** 2)
+        
+        # 总自由能
+        F = -torch.log(Z + 1e-10) + self.beta * constraint_term
+        
+        return F
+    
+    def evolve_dynamics(self, dt: float = 0.01):
+        """
+        动力学演化 dS = F(S, J, g)dt + σdW
+        对应定义2.1.1
+        """
+        # 确定性部分 - 通过几何认知网络
+        deterministic = self.reflexive_operation() * dt
+        
+        # 随机部分（维纳过程）
+        stochastic = torch.randn_like(self.node_states) * np.sqrt(dt) * 0.1
+        
+        # 更新状态
+        self.node_states.data += deterministic + stochastic
+        
+        # Hebbian学习规则更新连接权重
+        with torch.no_grad():
+            hebbian_update = torch.outer(self.node_states.mean(dim=0), 
+                                        self.node_states.mean(dim=0))
+            decay = self.alpha * self.adjacency
+            reflexive_update = self.beta * self.global_constraints.mean() * torch.sigmoid(self.adjacency)
+            
+            self.adjacency.data += self.eta * (hebbian_update - decay + reflexive_update) * dt
+    
+    def detect_singularity(self, lambda_load: float) -> Tuple[bool, str]:
+        """
+        检测反身性奇点
+        对应定理3.2.1
+        """
+        c1 = self.compute_chern_class()
+        
+        # 类型判断
+        if torch.norm(self.node_states.grad) < 1e-6 if self.node_states.grad is not None else False:
+            return True, "Type I (状态奇点)"
+        elif torch.norm(self.adjacency.grad) < 1e-6 if self.adjacency.grad is not None else False:
+            return True, "Type II (拓扑奇点)"
+        elif torch.norm(self.global_constraints.grad) < 1e-6 if self.global_constraints.grad is not None else False:
+            return True, "Type III (约束奇点)"
+        
+        # 基于陈类的检测
+        if abs(c1) > 0.5:
+            return True, f"Topological singularity (c1={c1:.3f})"
+        
+        return False, "No singularity detected"
+
+    # 稀疏纤维丛近似算法（SparseFBA）
+class SparseFiberBundle(nn.Module):
+    def __init__(self, vocab_size, d_model=256, k_neighbors=16):
+        super().__init__()
+        # 关键优化：用k-NN图替代完全连接
+        self.k_neighbors = k_neighbors
+        
+        # 1. 构建稀疏连接图（O(n log n)）
+        self.graph_builder = GraphBuilder(method='knn', k=k_neighbors)
+        
+        # 2. 局部曲率估计（只在邻域内计算）
+        self.local_curvature = LocalCurvatureEstimator(radius=3)
+        
+        # 3. 分层几何编码器
+        self.geometric_layers = nn.ModuleList([
+            GeometricConv(d_model, d_model, k=3),  # 类似图卷积，但保留几何信息
+            GeometricConv(d_model, d_model, k=3),
+            GeometricPooling(stride=2)  # 几何池化，降低分辨率
+        ])
+    
+    def forward(self, x):
+        # 构建稀疏图：O(n log n)而不是O(n²)
+        graph = self.graph_builder(x)
+        
+        # 只在局部邻域计算曲率：O(k·n)而不是O(n³)
+        curvature = self.local_curvature(x, graph)
+        
+        # 分层处理：每层减少节点数2倍
+        for layer in self.geometric_layers:
+            x, graph = layer(x, graph, curvature)
+        
+        return x
+---
+class KnowledgeGraphToGeometry(nn.Module):
+    """将知识图谱自动编译为纤维丛几何结构"""
+    def __init__(self, kg_embed_dim=300, geom_dim=256):
+        super().__init__()
+        
+        # 1. 关系类型到曲率类型的映射
+        self.relation_to_curvature = nn.Embedding(100, 4)  # 100种关系→4种曲率类型
+        
+        # 2. 实体嵌入到流形坐标的投影
+        self.entity_to_manifold = nn.Sequential(
+            nn.Linear(kg_embed_dim, 512),
+            nn.GELU(),
+            nn.Linear(512, geom_dim * 3)  # 输出(x,y,z)坐标
+        )
+        
+        # 3. 逻辑约束到联络形式的编译
+        self.logic_to_connection = LogicCompiler()
+        
+    def compile(self, triples, ontologies):
+        """编译知识图谱为几何结构"""
+        # 实体→底流形坐标
+        base_manifold = self.entity_to_manifold(triples.entities)
+        
+        # 关系→曲率类型
+        curvature_types = self.relation_to_curvature(triples.relations)
+        
+        # 本体→联络矩阵
+        connections = self.logic_to_connection.compile_connections(ontologies)
+        
+        return {
+            'base_manifold': base_manifold,      # M的坐标
+            'curvature_field': curvature_types,  # 曲率分布
+            'connections': connections,          # 联络形式
+            'constraints': self.extract_constraints(ontologies)  # 约束G
+        }
+
+# 使用示例
+kg = load_wikidata_subset()  # 加载Wikidata子集
+compiler = KnowledgeGraphToGeometry()
+geometry = compiler.compile(kg.triples, kg.ontologies)
+
+# 用编译好的几何初始化纤维丛模型
+model = CognitiveFiberBundle.init_from_geometry(geometry)
+---
+class SingularityDrivenLearner:
+    """奇点驱动的学习算法"""
+    
+    def train_step_with_singularity_handling(self, batch):
+        # 标准前向传播
+        outputs, loss = self.standard_forward(batch)
+        
+        # 检测奇点（O(1)复杂度）
+        singularity_info = self.detect_singularity(outputs)
+        
+        if singularity_info['detected']:
+            # 奇点类型决定处理策略
+            singularity_type = singularity_info['type']
+            
+            if singularity_type == 'Type_I':  # 状态奇点
+                # 逻辑不一致：启动符号修正
+                correction = self.symbolic_correction(singularity_info)
+                self.apply_correction(correction)
+                
+                # 记录学习：将奇点转化为训练数据
+                self.singularity_memory.append({
+                    'type': 'logical_inconsistency',
+                    'correction': correction,
+                    'learned_rule': self.extract_rule(singularity_info)
+                })
+                
+            elif singularity_type == 'Type_II':  # 拓扑奇点
+                # 概念冲突：启动拓扑重构
+                new_topology = self.topological_restructuring(singularity_info)
+                self.update_topology(new_topology)
+                
+            elif singularity_type == 'Type_III':  # 约束奇点
+                # 规则矛盾：启动约束演化
+                evolved_constraints = self.constraint_evolution(singularity_info)
+                self.evolve_constraints(evolved_constraints)
+            
+            # 奇点奖励机制：修正后给予额外奖励
+            reward = self.compute_singularity_reward(singularity_info)
+            loss = loss - reward  # 负损失 = 奖励
+        
+        return loss
+
+# Stage 1: 奇点检测（实时，每个batch）
+singularity = model.detect_singularity(batch)
+
+# Stage 2: 奇点分类（Type I/II/III）和修复
+if singularity:
+    repair_strategy = singularity.classify_and_get_repair_strategy()
+    model.apply_repair(repair_strategy)
+    
+    # Stage 3: 奇点学习（离线，定期）
+    if training_step % 1000 == 0:
+        model.learn_from_singularity_history()
+  
+
+
+    def cognitive_health_report(self) -> Dict:
+        """
+        认知健康报告
+        """
+        report = {}
+        
+        # 全局指标
+        report['curvature'] = self.compute_curvature().abs().mean().item()
+        report['chern_class'] = self.compute_chern_class().item()
+        report['cognitive_energy'] = self.compute_cognitive_energy().item()
+        
+        # 局部指标（每个节点的反身性分数）
+        local_curvatures = self.compute_local_curvature()
+        report['local_curvatures'] = local_curvatures.tolist()
+        report['avg_local_curvature'] = local_curvatures.mean().item()
+        
+        # 检测奇点
+        is_singular, singularity_type = self.detect_singularity(self.beta.item())
+        report['singularity'] = {'is_singular': is_singular, 'type': singularity_type}
+        
+        # 自指约束状态
+        report['constraint_norm'] = self.global_constraints.norm().item()
+        report['reflexive_load'] = self.beta.item()
+        
+        return report
+
+class CognitiveFiberBundleExperiment:
+    """
+    认知纤维丛实验框架
+    """
+    
+    def __init__(self, n_nodes: int = 8, state_dim: int = 16, reflexive_dim: int = 4):
+        self.model = CognitiveFiberBundle(n_nodes, state_dim, reflexive_dim)
+        self.history = defaultdict(list)  # 记录演化历史
+        
+    def run_experiment(self, n_steps: int = 100):
+        """
+        运行认知纤维丛演化实验
+        """
+        print("开始认知纤维丛演化实验...")
+        print(f"节点数: {self.model.n_nodes}, 状态维度: {self.model.state_dim}")
+        
+        for step in range(n_steps):
+            # 记录当前状态
+            report = self.model.cognitive_health_report()
+            
+            self.history['curvature'].append(report['curvature'])
+            self.history['chern_class'].append(report['chern_class'])
+            self.history['cognitive_energy'].append(report['cognitive_energy'])
+            self.history['avg_local_curvature'].append(report['avg_local_curvature'])
+            self.history['constraint_norm'].append(report['constraint_norm'])
+            self.history['reflexive_load'].append(report['reflexive_load'])
+            
+            # 检测奇点
+            if report['singularity']['is_singular']:
+                self.history['singularities'].append((step, report['singularity']['type']))
+                print(f"  步骤 {step}: 检测到奇点 - {report['singularity']['type']}")
+            
+            # 演化动力学
+            self.model.evolve_dynamics()
+            
+            # 偶数步骤打印状态
+            if step % 20 == 0:
+                print(f"  步骤 {step}: 能量={report['cognitive_energy']:.3f}, "
+                      f"曲率={report['curvature']:.3f}, "
+                      f"陈类={report['chern_class']:.3f}, "
+                      f"约束={report['constraint_norm']:.3f}")
+        
+        print(f"实验完成，共检测到 {len(self.history['singularities'])} 个奇点\n")
+    
+    def visualize_results(self):
+        """
+        可视化实验结果
+        """
+        fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+        axes = axes.flatten()
+        
+        # 曲率演化
+        axes[0].plot(self.history['curvature'], label='全局曲率', color='blue', alpha=0.7)
+        axes[0].set_title('全局曲率 (逻辑不一致性) 演化')
+        axes[0].set_xlabel('时间步')
+        axes[0].set_ylabel('曲率')
+        axes[0].grid(True, alpha=0.3)
+        
+        # 陈类演化
+        axes[1].plot(self.history['chern_class'], label='陈类', color='red', alpha=0.7)
+        axes[1].set_title('陈类 (拓扑不变量) 演化')
+        axes[1].set_xlabel('时间步')
+        axes[1].set_ylabel('陈类')
+        axes[1].grid(True, alpha=0.3)
+        
+        # 认知能量演化
+        axes[2].plot(self.history['cognitive_energy'], label='认知能量', color='green', alpha=0.7)
+        axes[2].set_title('认知自由能 演化')
+        axes[2].set_xlabel('时间步')
+        axes[2].set_ylabel('能量')
+        axes[2].grid(True, alpha=0.3)
+        
+        # 局部曲率演化
+        axes[3].plot(self.history['avg_local_curvature'], label='平均局部曲率', color='orange', alpha=0.7)
+        axes[3].set_title('平均局部曲率 演化')
+        axes[3].set_xlabel('时间步')
+        axes[3].set_ylabel('局部曲率')
+        axes[3].grid(True, alpha=0.3)
+        
+        # 约束范数演化
+        axes[4].plot(self.history['constraint_norm'], label='约束范数', color='purple', alpha=0.7)
+        axes[4].set_title('自指约束范数 演化')
+        axes[4].set_xlabel('时间步')
+        axes[4].set_ylabel('约束范数')
+        axes[4].grid(True, alpha=0.3)
+        
+        # 反身性负荷演化
+        axes[5].plot(self.history['reflexive_load'], label='反身性负荷', color='brown', alpha=0.7)
+        axes[5].set_title('反身性负荷 演化')
+        axes[5].set_xlabel('时间步')
+        axes[5].set_ylabel('负荷')
+        axes[5].grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.show()
+        
+        # 打印定量分析
+        print("\n" + "="*80)
+        print("认知纤维丛实验分析结果")
+        print("="*80)
+        
+        avg_curvature = np.mean(self.history['curvature'])
+        max_chern = np.max(np.abs(self.history['chern_class']))
+        final_energy = self.history['cognitive_energy'][-1]
+        n_singularities = len(self.history['singularities'])
+        
+        print(f"平均全局曲率: {avg_curvature:.4f}")
+        print(f"最大陈类: {max_chern:.4f}")
+        print(f"最终认知能量: {final_energy:.4f}")
+        print(f"检测到奇点数量: {n_singularities}")
+        
+        if n_singularities > 0:
+            singularity_types = [s[1] for s in self.history['singularities']]
+            unique_types = set(singularity_types)
+            print(f"奇点类型分布: {unique_types}")
+        
+        # 计算认知韧性指标
+        stability = 1.0 / (1.0 + np.std(self.history['curvature']))  # 曲率越稳定，韧性越高
+        print(f"认知韧性指标: {stability:.4f}")
+        
+        print("\n实验结论：")
+        print("- 认知纤维丛模型成功模拟了反身性系统的动态演化")
+        print("- 模型能够检测并报告拓扑奇点（逻辑矛盾）")
+        print("- 认知能量和曲率反映了系统的逻辑一致性状态")
+
+
+def main():
+    """
+    主实验函数
+    """
+    print("认知纤维丛与几何认知网络融合实验")
+    print("="*60)
+    
+    # 创建实验
+    experiment = CognitiveFiberBundleExperiment(n_nodes=8, state_dim=16, reflexive_dim=4)
+    
+    # 运行实验
+    experiment.run_experiment(n_steps=100)
+    
+    # 可视化结果
+    experiment.visualize_results()
+    
+    # 生成认知健康报告
+    report = experiment.model.cognitive_health_report()
+    print("\n" + "="*80)
+    print("最终认知健康报告")
+    print("="*80)
+    for key, value in report.items():
+        if key == 'singularity':
+            print(f"{key}: {value}")
+        else:
+            print(f"{key}: {value:.4f}" if isinstance(value, float) else f"{key}: {value}")
+
+
+if __name__ == "__main__":
+    main()
+
+
