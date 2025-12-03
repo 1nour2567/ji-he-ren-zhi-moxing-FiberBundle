@@ -1,0 +1,494 @@
+import torch
+import torch.nn as nn
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.sparse.csgraph import connected_components
+
+class SparseFiberBundle(nn.Module):
+    """稀疏纤维丛近似算法 - 支持约束奇点检测"""
+    def __init__(self, vocab_size, d_model=64, k_neighbors=8):
+        super().__init__()
+        self.k_neighbors = k_neighbors
+        self.d_model = d_model
+        self.vocab_size = vocab_size
+        
+        # 存储中间激活值用于奇点检测
+        self.activations = {}
+        
+        # 约束系统：存储逻辑约束
+        self.constraint_system = nn.ParameterDict({
+            'consistency_constraint': nn.Parameter(torch.tensor(1.0)),  # 一致性约束
+            'symmetry_constraint': nn.Parameter(torch.tensor(0.0)),     # 对称性约束
+            'transitivity_constraint': nn.Parameter(torch.tensor(0.0))  # 传递性约束
+        })
+        
+        # 约束激活历史
+        self.constraint_history = {}
+        
+        # 几何编码层
+        self.geometric_layers = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(d_model, d_model),
+                nn.GELU()
+            ),
+            nn.Sequential(
+                nn.Linear(d_model, d_model),
+                nn.GELU()
+            )
+        ])
+    
+    def compute_constraint_violations(self, x):
+        """计算约束违反情况"""
+        batch_size, n, d = x.shape
+        
+        # 一致性约束：相邻元素值应该相近
+        consistency_violation = 0.0
+        if n > 1:
+            for i in range(n-1):
+                consistency_violation += torch.mean(torch.abs(x[:, i, :] - x[:, i+1, :]))
+        
+        # 对称性约束：x[i,j] = x[j,i] (如果x是关系矩阵)
+        symmetry_violation = 0.0
+        if n > 2:
+            x_flat = x.view(batch_size * n, d)
+            similarity = torch.mm(x_flat, x_flat.t())
+            # 检查对称性
+            symmetry_violation = torch.mean(torch.abs(similarity - similarity.t()))
+        
+        # 传递性约束：如果a→b, b→c，则应该a→c
+        transitivity_violation = 0.0
+        if n > 3:
+            x_flat = x.view(batch_size * n, d)
+            similarity = torch.mm(x_flat, x_flat.t())
+            # 传递性：A×B×C应接近A×C
+            similarity_sq = torch.mm(similarity, similarity)
+            transitivity_violation = torch.mean(torch.abs(similarity_sq - similarity))
+        
+        return {
+            'consistency_violation': consistency_violation.item(),
+            'symmetry_violation': symmetry_violation.item(),
+            'transitivity_violation': transitivity_violation.item()
+        }
+    
+    def compute_connectivity_matrix(self, x):
+        """计算激活模式的连接性矩阵"""
+        batch_size, n, d = x.shape
+        x_flat = x.view(batch_size * n, d)
+        similarity = torch.mm(x_flat, x_flat.t()) / (
+            torch.norm(x_flat, dim=1, keepdim=True) * torch.norm(x_flat, dim=1, keepdim=True).t() + 1e-8
+        )
+        return torch.clamp(similarity, min=0.0)
+    
+    def compute_topological_features(self, x):
+        """计算拓扑特征"""
+        connectivity = self.compute_connectivity_matrix(x)
+        batch_size = x.shape[0]
+        
+        connectivity_np = connectivity.detach().cpu().numpy()
+        n_components, labels = connected_components(
+            csgraph=connectivity_np, 
+            directed=False, 
+            return_labels=True
+        )
+        
+        return {
+            'n_components': n_components,
+            'connectivity': connectivity,
+            'labels': torch.tensor(labels).to(x.device),
+            'density': torch.mean(connectivity).item()
+        }
+    
+    def forward(self, x):
+        """x: [batch_size, vocab_size, d_model]"""
+        batch_size, n, d = x.shape
+        x_flat = x.view(-1, d)
+        
+        # 保存输入用于奇点检测
+        self.activations['input'] = x.clone()
+        self.activations['input_topology'] = self.compute_topological_features(x)
+        self.activations['input_constraints'] = self.compute_constraint_violations(x)
+        
+        # 应用几何变换
+        for i, layer in enumerate(self.geometric_layers):
+            x_flat = layer(x_flat)
+            layer_output = x_flat.view(batch_size, n, d)
+            
+            self.activations[f'layer{i+1}'] = layer_output.clone()
+            self.activations[f'layer{i+1}_topology'] = self.compute_topological_features(layer_output)
+            self.activations[f'layer{i+1}_constraints'] = self.compute_constraint_violations(layer_output)
+        
+        x = x_flat.view(batch_size, n, d)
+        self.activations['output'] = x.clone()
+        self.activations['output_topology'] = self.compute_topological_features(x)
+        self.activations['output_constraints'] = self.compute_constraint_violations(x)
+        
+        return x
+
+class SingularityDrivenLearner:
+    """奇点驱动学习算法 - 支持Type I, II, III奇点"""
+    def __init__(self, model):
+        self.model = model
+        self.singularity_history = []
+        self.singularity_threshold = 2.0  # 逻辑奇点阈值
+        self.topology_change_threshold = 0.5  # 拓扑变化阈值
+        self.constraint_violation_threshold = 1.0  # 约束违反阈值
+    
+    def detect_type_I_singularities(self):
+        """检测Type I奇点（逻辑奇点）"""
+        detected_singularities = []
+        
+        for layer_name, activation in self.model.activations.items():
+            if 'topology' not in layer_name and 'constraints' not in layer_name:
+                max_abs = torch.max(torch.abs(activation))
+                if max_abs > self.singularity_threshold:
+                    positions = torch.where(torch.abs(activation) > self.singularity_threshold)
+                    detected_singularities.append({
+                        'type': 'Type_I',
+                        'layer': layer_name,
+                        'detected': True,
+                        'value': max_abs.item(),
+                        'positions': positions,
+                        'count': len(positions[0])
+                    })
+        
+        return detected_singularities
+    
+    def detect_type_II_singularities(self):
+        """检测Type II奇点（拓扑奇点）"""
+        detected_singularities = []
+        
+        topology_keys = [k for k in self.model.activations.keys() if 'topology' in k]
+        
+        for i in range(len(topology_keys)-1):
+            current_key = topology_keys[i]
+            next_key = topology_keys[i+1]
+            
+            current_topo = self.model.activations[current_key]
+            next_topo = self.model.activations[next_key]
+            
+            comp_change = abs(current_topo['n_components'] - next_topo['n_components'])
+            density_change = abs(current_topo['density'] - next_topo['density'])
+            
+            if comp_change > 0 or density_change > self.topology_change_threshold:
+                detected_singularities.append({
+                    'type': 'Type_II',
+                    'layer_transition': f"{current_key} -> {next_key}",
+                    'detected': True,
+                    'n_components_change': comp_change,
+                    'density_change': density_change,
+                    'current_components': current_topo['n_components'],
+                    'next_components': next_topo['n_components']
+                })
+        
+        return detected_singularities
+    
+    def detect_type_III_singularities(self):
+        """检测Type III奇点（约束奇点）"""
+        detected_singularities = []
+        
+        constraint_keys = [k for k in self.model.activations.keys() if 'constraints' in k]
+        
+        for key in constraint_keys:
+            constraints = self.model.activations[key]
+            
+            # 检查各种约束违反
+            if constraints['consistency_violation'] > self.constraint_violation_threshold:
+                detected_singularities.append({
+                    'type': 'Type_III',
+                    'layer': key,
+                    'constraint_type': 'consistency',
+                    'violation_value': constraints['consistency_violation'],
+                    'detected': True
+                })
+            
+            if constraints['symmetry_violation'] > self.constraint_violation_threshold:
+                detected_singularities.append({
+                    'type': 'Type_III',
+                    'layer': key,
+                    'constraint_type': 'symmetry',
+                    'violation_value': constraints['symmetry_violation'],
+                    'detected': True
+                })
+            
+            if constraints['transitivity_violation'] > self.constraint_violation_threshold:
+                detected_singularities.append({
+                    'type': 'Type_III',
+                    'layer': key,
+                    'constraint_type': 'transitivity',
+                    'violation_value': constraints['transitivity_violation'],
+                    'detected': True
+                })
+        
+        return detected_singularities
+    
+    def apply_repair_to_tensor(self, tensor):
+        """对张量应用修复策略"""
+        repaired = torch.clamp(tensor, -1.0, 1.0)
+        return repaired
+    
+    def apply_constraint_repair(self, tensor, constraint_violations):
+        """应用约束修复策略"""
+        batch_size, n, d = tensor.shape
+        
+        # 根据约束违反类型应用不同修复策略
+        if constraint_violations.get('consistency_violation', 0) > self.constraint_violation_threshold:
+            # 一致性修复：平滑相邻元素
+            for i in range(n-1):
+                tensor[:, i, :] = 0.5 * (tensor[:, i, :] + tensor[:, i+1, :])
+        
+        if constraint_violations.get('symmetry_violation', 0) > self.constraint_violation_threshold:
+            # 对称性修复：确保对称性
+            x_flat = tensor.view(batch_size * n, d)
+            similarity = torch.mm(x_flat, x_flat.t())
+            # 强制对称性
+            sym_similarity = 0.5 * (similarity + similarity.t())
+            # 反向投影（简化版）
+            tensor = torch.mean(tensor, dim=1, keepdim=True).expand_as(tensor)
+        
+        return tensor
+    
+    def train_step_with_comprehensive_repair(self, batch):
+        """全面修复模式：检测并修复所有类型奇点"""
+        # 1. 前向传播
+        outputs = self.model(batch)
+        
+        # 2. 检测所有类型奇点
+        type_I_singularities = self.detect_type_I_singularities()
+        type_II_singularities = self.detect_type_II_singularities()
+        type_III_singularities = self.detect_type_III_singularities()
+        
+        # 3. 合并所有奇点
+        all_singularities = type_I_singularities + type_II_singularities + type_III_singularities
+        
+        # 4. 应用修复
+        repaired_outputs = outputs.clone()
+        
+        if type_I_singularities:
+            repaired_outputs = self.apply_repair_to_tensor(repaired_outputs)
+        
+        if type_III_singularities:
+            # 获取输出层约束
+            output_constraints = self.model.activations['output_constraints']
+            repaired_outputs = self.apply_constraint_repair(repaired_outputs, output_constraints)
+        
+        # 5. 记录奇点历史
+        self.singularity_history.extend(all_singularities)
+        
+        # 6. 计算损失
+        loss = torch.mean((repaired_outputs - batch) ** 2)
+        
+        # 7. 奇点奖励机制
+        if all_singularities:
+            reward = 0.1 * len(all_singularities)
+            loss = loss - reward
+        
+        return repaired_outputs, loss, all_singularities
+
+def visualize_all_types_singularity_detection():
+    """可视化所有类型奇点检测"""
+    # 模拟数据
+    batch_size = 1
+    vocab_size = 10
+    d_model = 64
+    
+    # 1. 创建模型
+    model = SparseFiberBundle(vocab_size, d_model=d_model)
+    learner = SingularityDrivenLearner(model)
+    
+    # 2. 创建包含各种异常的输入
+    inputs = torch.randn(batch_size, vocab_size, d_model)
+    
+    # 制造三种异常：
+    # Type I: 逻辑异常
+    inputs[0, 0, 0] = 10.0
+    inputs[0, 1, 1] = -15.0
+    
+    # Type II: 拓扑异常（通过极端值影响连接性）
+    inputs[0, 2, :] = 20.0  # 高激活值
+    inputs[0, 3, :] = -20.0  # 高激活值
+    
+    # Type III: 约束异常（破坏逻辑约束）
+    inputs[0, 4, :] = torch.ones(d_model) * 10  # 一致性破坏
+    inputs[0, 5, :] = torch.ones(d_model) * -10 # 一致性破坏
+    
+    print("🔍 制造的异常值:")
+    print(f"  Type I (逻辑): 位置(0,0,0)={inputs[0, 0, 0].item():.2f}, (0,1,1)={inputs[0, 1, 1].item():.2f}")
+    print(f"  Type II (拓扑): 位置(0,2,:)和(0,3,:)（高激活值）")
+    print(f"  Type III (约束): 位置(0,4,:)和(0,5,:)（破坏一致性）")
+    
+    # 3. 全面修复训练
+    outputs, loss, detected_singularities = learner.train_step_with_comprehensive_repair(inputs)
+    
+    # 4. 可视化
+    fig, axes = plt.subplots(3, 3, figsize=(18, 15))
+    axes = axes.flatten()
+    
+    # Type I: 逻辑异常
+    input_flat = inputs[0].view(-1).detach().numpy()
+    axes[0].hist(input_flat, bins=50, alpha=0.7, color='red', edgecolor='black')
+    axes[0].set_title('输入数据分布 (含逻辑异常)', fontsize=12)
+    axes[0].set_xlabel('值')
+    axes[0].set_ylabel('频次')
+    axes[0].axvline(x=learner.singularity_threshold, color='orange', linestyle='--', label='逻辑阈值')
+    axes[0].axvline(x=-learner.singularity_threshold, color='orange', linestyle='--')
+    axes[0].legend()
+    
+    output_flat = outputs[0].view(-1).detach().numpy()
+    axes[1].hist(output_flat, bins=50, alpha=0.7, color='blue', edgecolor='black')
+    axes[1].set_title('输出数据分布 (修复后)', fontsize=12)
+    axes[1].set_xlabel('值')
+    axes[1].set_ylabel('频次')
+    axes[1].axvline(x=1, color='green', linestyle='--', label='修复边界')
+    axes[1].axvline(x=-1, color='green', linestyle='--')
+    axes[1].legend()
+    
+    # Type II: 拓扑异常
+    topo_info = model.activations['input_topology']
+    next_topo_info = model.activations['output_topology']
+    
+    axes[2].bar(['输入层', '输出层'], 
+                [topo_info['n_components'], next_topo_info['n_components']], 
+                color=['red', 'blue'], alpha=0.7)
+    axes[2].set_title(f'拓扑连通分量数\n输入: {topo_info["n_components"]}, 输出: {next_topo_info["n_components"]}', 
+                     fontsize=12)
+    axes[2].set_ylabel('连通分量数')
+    
+    axes[3].bar(['输入层', '输出层'], 
+                [topo_info['density'], next_topo_info['density']], 
+                color=['red', 'blue'], alpha=0.7)
+    axes[3].set_title(f'连接密度\n输入: {topo_info["density"]:.3f}, 输出: {next_topo_info["density"]:.3f}', 
+                     fontsize=12)
+    axes[3].set_ylabel('连接密度')
+    
+    # Type III: 约束异常
+    input_constraints = model.activations['input_constraints']
+    output_constraints = model.activations['output_constraints']
+    
+    constraint_names = ['一致性', '对称性', '传递性']
+    input_violations = [
+        input_constraints['consistency_violation'],
+        input_constraints['symmetry_violation'], 
+        input_constraints['transitivity_violation']
+    ]
+    output_violations = [
+        output_constraints['consistency_violation'],
+        output_constraints['symmetry_violation'],
+        output_constraints['transitivity_violation']
+    ]
+    
+    x = np.arange(len(constraint_names))
+    width = 0.35
+    axes[4].bar(x - width/2, input_violations, width, label='修复前', alpha=0.7, color='red')
+    axes[4].bar(x + width/2, output_violations, width, label='修复后', alpha=0.7, color='blue')
+    axes[4].set_title('约束违反程度对比', fontsize=12)
+    axes[4].set_xlabel('约束类型')
+    axes[4].set_ylabel('违反程度')
+    axes[4].set_xticks(x)
+    axes[4].set_xticklabels(constraint_names)
+    axes[4].legend()
+    
+    # 修复前后对比
+    n_compare = min(100, input_flat.shape[0])
+    x_pos = np.arange(n_compare)
+    
+    axes[5].plot(x_pos, input_flat[:n_compare], 'ro-', alpha=0.6, label='修复前', markersize=4)
+    axes[5].plot(x_pos, output_flat[:n_compare], 'bo-', alpha=0.6, label='修复后', markersize=4)
+    axes[5].set_title('修复前后对比 (前100个值)', fontsize=12)
+    axes[5].set_xlabel('元素索引')
+    axes[5].set_ylabel('值')
+    axes[5].legend()
+    axes[5].grid(True, alpha=0.3)
+    
+    # 奇点类型统计
+    type_I_count = len([s for s in detected_singularities if s['type'] == 'Type_I'])
+    type_II_count = len([s for s in detected_singularities if s['type'] == 'Type_II'])
+    type_III_count = len([s for s in detected_singularities if s['type'] == 'Type_III'])
+    
+    if type_I_count + type_II_count + type_III_count > 0:
+        bars = axes[6].bar(['Type I (逻辑)', 'Type II (拓扑)', 'Type III (约束)'], 
+                          [type_I_count, type_II_count, type_III_count], 
+                          color=['orange', 'purple', 'green'], alpha=0.7)
+        axes[6].set_title(f'检测到的奇点类型\n总计: {len(detected_singularities)}个', fontsize=12)
+        axes[6].set_ylabel('数量')
+        
+        for bar, count in zip(bars, [type_I_count, type_II_count, type_III_count]):
+            axes[6].text(bar.get_x() + bar.get_width()/2., bar.get_height() + 0.05,
+                        f'{count}', ha='center', va='bottom', fontsize=12)
+    else:
+        axes[6].text(0.5, 0.5, '✅ 未检测到奇点\n(已成功修复)', 
+                    horizontalalignment='center', verticalalignment='center',
+                    transform=axes[6].transAxes, fontsize=14)
+        axes[6].set_title('奇点检测结果', fontsize=12)
+        axes[6].set_xlim(0, 1)
+        axes[6].set_ylim(0, 1)
+    
+    # 约束修复效果
+    constraint_types = ['consistency', 'symmetry', 'transitivity']
+    input_violations_by_type = []
+    output_violations_by_type = []
+    
+    for ctype in constraint_types:
+        input_violations_by_type.append(input_constraints[f'{ctype}_violation'])
+        output_violations_by_type.append(output_constraints[f'{ctype}_violation'])
+    
+    x = np.arange(len(constraint_types))
+    axes[7].plot(x, input_violations_by_type, 'ro-', label='修复前', linewidth=2)
+    axes[7].plot(x, output_violations_by_type, 'bo-', label='修复后', linewidth=2)
+    axes[7].set_title('各约束类型修复效果', fontsize=12)
+    axes[7].set_xlabel('约束类型')
+    axes[7].set_ylabel('违反程度')
+    axes[7].set_xticks(x)
+    axes[7].set_xticklabels(['一致性', '对称性', '传递性'])
+    axes[7].legend()
+    axes[7].grid(True, alpha=0.3)
+    
+    # 拓扑稳定性
+    topo_stable = abs(topo_info['n_components'] - next_topo_info['n_components']) <= 2
+    stability_text = '✅ 稳定' if topo_stable else '⚠️ 变化'
+    axes[8].text(0.5, 0.5, f'拓扑稳定性\n{stability_text}', 
+                horizontalalignment='center', verticalalignment='center',
+                transform=axes[8].transAxes, fontsize=14, 
+                bbox=dict(boxstyle="round,pad=0.3", facecolor="lightgreen" if topo_stable else "lightcoral"))
+    axes[8].set_title('拓扑稳定性评估', fontsize=12)
+    axes[8].set_xlim(0, 1)
+    axes[8].set_ylim(0, 1)
+    
+    plt.tight_layout()
+    plt.show()
+    
+    # 打印详细结果
+    print(f"\n✅ 全面修复结果:")
+    print(f"  训练损失: {loss.item():.4f}")
+    print(f"  检测到奇点总数: {len(detected_singularities)}")
+    print(f"  Type I奇点数量: {type_I_count}")
+    print(f"  Type II奇点数量: {type_II_count}")
+    print(f"  Type III奇点数量: {type_III_count}")
+    
+    if detected_singularities:
+        print(f"  详细奇点信息:")
+        for i, sing in enumerate(detected_singularities):
+            if sing['type'] == 'Type_I':
+                print(f"    [{i+1}] Type I: 层={sing['layer']}, 值={sing['value']:.2f}, 数量={sing['count']}个")
+            elif sing['type'] == 'Type_II':
+                print(f"    [{i+1}] Type II: {sing['layer_transition']}, "
+                      f"连通分量变化={sing['n_components_change']}, "
+                      f"密度变化={sing['density_change']:.3f}")
+            else:  # Type III
+                print(f"    [{i+1}] Type III: 层={sing['layer']}, "
+                      f"约束类型={sing['constraint_type']}, "
+                      f"违反值={sing['violation_value']:.3f}")
+    
+    # 验证修复效果
+    input_max = torch.max(torch.abs(inputs)).item()
+    output_max = torch.max(torch.abs(outputs)).item()
+    print(f"  修复前最大绝对值: {input_max:.2f}")
+    print(f"  修复后最大绝对值: {output_max:.2f}")
+    print(f"  修复效果: {'✅ 成功' if output_max <= 1.0 else '⚠️ 部分修复'}")
+    
+    # 拓扑稳定性分析
+    topo_stable = abs(topo_info['n_components'] - output_topo_info['n_components']) <= 2
+    print(f"  拓扑稳定性: {'✅ 稳定' if topo_stable else '⚠️ 变化较大'}")
+
+# 运行全面可视化
+if __name__ == "__main__":
+    visualize_all_types_singularity_detection()
