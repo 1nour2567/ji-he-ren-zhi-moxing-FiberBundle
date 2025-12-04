@@ -1,0 +1,455 @@
+import torch
+import torch.nn as nn
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.ensemble import IsolationForest
+from sklearn.preprocessing import StandardScaler
+import math
+import time
+from collections import deque
+import warnings
+warnings.filterwarnings('ignore')
+
+class CognitiveFiberBundle(nn.Module):
+    """认知纤维丛模型 - AGI安全监控核心"""
+    def __init__(self, vocab_size, d_model=64, k_neighbors=8):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+        self.k_neighbors = k_neighbors
+        
+        # 动态联络形式网络
+        self.connection_network = nn.Sequential(
+            nn.Linear(d_model, d_model * 2),
+            nn.GELU(),
+            nn.Linear(d_model * 2, d_model * d_model)
+        )
+        
+        # 曲率计算网络
+        self.curvature_network = nn.Sequential(
+            nn.Linear(d_model * d_model, d_model * 4),
+            nn.GELU(),
+            nn.Linear(d_model * 4, d_model * d_model)
+        )
+        
+        # 几何编码层
+        self.geometric_layers = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(d_model, d_model),
+                nn.GELU(),
+                nn.Dropout(0.1)
+            ),
+            nn.Sequential(
+                nn.Linear(d_model, d_model),
+                nn.GELU(),
+                nn.Dropout(0.1)
+            )
+        ])
+        
+        # 缓存
+        self.activation_cache = deque(maxlen=100)
+        self.topology_cache = deque(maxlen=100)
+        self.monitoring_enabled = True
+        
+    def compute_connection_form(self, x):
+        batch_size, n, d = x.shape
+        x_flat = x.reshape(-1, d)
+        connection_params = self.connection_network(x_flat)
+        connection = connection_params.reshape(-1, d, d)
+        connection_sym = 0.5 * (connection + connection.transpose(1, 2))
+        connection_anti = 0.5 * (connection - connection.transpose(1, 2))
+        final_connection = connection_sym * 0.3 + connection_anti * 0.7
+        return final_connection.reshape(batch_size, n, d, d)
+    
+    def compute_curvature_form(self, connection):
+        batch_size, n, d, _ = connection.shape
+        connection_flat = connection.reshape(-1, d, d)
+        A_wedge_A = torch.bmm(connection_flat, connection_flat) - \
+                   torch.bmm(connection_flat.transpose(1, 2), connection_flat)
+        if n > 1:
+            conn = connection.reshape(batch_size, n, d, d)
+            dA = torch.zeros_like(conn)
+            for i in range(n-1):
+                dA[:, i] = conn[:, i+1] - conn[:, i]
+            dA[:, -1] = conn[:, -1] - conn[:, -2]
+            dA_flat = dA.reshape(-1, d, d)
+        else:
+            dA_flat = torch.zeros_like(connection_flat)
+        curvature = dA_flat + A_wedge_A
+        curvature_params = curvature.reshape(-1, d*d)
+        enhanced_curvature = self.curvature_network(curvature_params)
+        return enhanced_curvature.reshape(batch_size, n, d, d)
+    
+    def compute_chern_classes(self, curvature):
+        batch_size, n, d, _ = curvature.shape
+        results = {k: [] for k in ['first_chern', 'second_chern', 'chern_ratio',
+                                   'curvature_norm', 'curvature_trace', 'euler_characteristic']}
+        curvature_flat = curvature.reshape(-1, d, d)
+        for i in range(batch_size * n):
+            F = curvature_flat[i]
+            trace_F = torch.trace(F)
+            first_chern = (1j / (2 * math.pi)) * trace_F
+            F_sq = torch.mm(F, F)
+            trace_F_sq = torch.trace(F_sq)
+            second_chern = (1 / (8 * math.pi**2)) * (trace_F_sq - trace_F**2)
+            chern_ratio = abs(second_chern) / (abs(first_chern) + 1e-8)
+            results['first_chern'].append(first_chern.real)
+            results['second_chern'].append(second_chern.real)
+            results['chern_ratio'].append(chern_ratio)
+            results['curvature_norm'].append(torch.norm(F).item())
+            results['curvature_trace'].append(trace_F.real.item())
+            euler_approx = 2 * first_chern.real - second_chern.real
+            results['euler_characteristic'].append(euler_approx)
+        for key in results:
+            # ✅ 确保输出为 float32 张量
+            results[key] = torch.tensor(results[key], dtype=torch.float32).reshape(batch_size, n)
+        return results
+    
+    def compute_topological_invariants(self, x):
+        connection = self.compute_connection_form(x)
+        curvature = self.compute_curvature_form(connection)
+        chern_classes = self.compute_chern_classes(curvature)
+        batch_size, n, d = x.shape
+        curvature_eigenvalues = []
+        curvature_flat = curvature.reshape(-1, d, d)
+        for i in range(batch_size * n):
+            F = curvature_flat[i].detach().cpu().numpy()
+            eigvals = np.linalg.eigvals(F)
+            curvature_eigenvalues.append(eigvals)
+        zero_curvature_dims = [np.sum(np.abs(eig) < 1e-6) for eig in curvature_eigenvalues]
+        persistence = [np.max(np.real(eig)) - np.min(np.real(eig)) for eig in curvature_eigenvalues]
+        # ✅ 关键修复：强制 float32
+        chern_classes['betti_approx'] = torch.tensor(zero_curvature_dims, dtype=torch.float32).reshape(batch_size, n)
+        chern_classes['persistence'] = torch.tensor(persistence, dtype=torch.float32).reshape(batch_size, n)
+        return chern_classes
+    
+    def forward(self, x):
+        batch_size, n, d = x.shape
+        if self.monitoring_enabled:
+            self.activation_cache.append({'type': 'input', 'data': x.detach().cpu().numpy(), 'timestamp': time.time()})
+        input_topology = self.compute_topological_invariants(x)
+        current_output = x
+        layer_topologies = {}
+        for i, layer in enumerate(self.geometric_layers):
+            flat_in = current_output.reshape(-1, d)
+            flat_out = layer(flat_in)
+            current_output = flat_out.reshape(batch_size, n, d)
+            layer_topology = self.compute_topological_invariants(current_output)
+            layer_topologies[f'layer_{i+1}'] = layer_topology
+            if self.monitoring_enabled:
+                self.activation_cache.append({
+                    'type': f'layer_{i+1}',
+                    'data': current_output.detach().cpu().numpy(),
+                    'timestamp': time.time()
+                })
+        output_topology = self.compute_topological_invariants(current_output)
+        if self.monitoring_enabled:
+            self.topology_cache.append({
+                'input': input_topology,
+                'layers': layer_topologies,
+                'output': output_topology,
+                'timestamp': time.time()
+            })
+        return {'output': current_output, 'topology': {
+            'input': input_topology,
+            'layers': layer_topologies,
+            'output': output_topology
+        }}
+
+class TopologicalAnomalyDetector:
+    def __init__(self):
+        self.scaler = StandardScaler()
+        self.anomaly_detector = IsolationForest(contamination=0.1, random_state=42)
+        self.fitted = False
+        self.feature_history = deque(maxlen=1000)
+        self.label_history = deque(maxlen=1000)
+        
+    def extract_topological_features(self, topology_data):
+        output_topo = topology_data['output']
+        features = [
+            torch.mean(output_topo['second_chern']).item(),
+            torch.std(output_topo['second_chern']).item(),
+            torch.mean(output_topo['curvature_norm']).item(),
+            torch.std(output_topo['curvature_norm']).item(),
+            torch.mean(output_topo['chern_ratio']).item(),
+            torch.std(output_topo['chern_ratio']).item(),
+            torch.mean(output_topo['euler_characteristic']).item(),
+            torch.mean(output_topo['betti_approx']).item(),      # ✅ 已确保为 float
+            torch.mean(output_topo['persistence']).item(),       # ✅ 已确保为 float
+            torch.mean(output_topo['curvature_trace']).item()
+        ]
+        for layer_key in ['layer_1', 'layer_2']:
+            if layer_key in topology_data['layers']:
+                layer_topo = topology_data['layers'][layer_key]
+                features.extend([
+                    torch.mean(layer_topo['second_chern']).item(),
+                    torch.mean(layer_topo['chern_ratio']).item()
+                ])
+        return np.array(features)
+    
+    def fit(self, topology_data_list):
+        features_list = [self.extract_topological_features(td) for td in topology_data_list]
+        features_array = np.array(features_list)
+        self.scaler.fit(features_array)
+        self.anomaly_detector.fit(self.scaler.transform(features_array))
+        self.fitted = True
+        return self
+    
+    def predict(self, topology_data):
+        if not self.fitted:
+            raise ValueError("检测器尚未训练，请先调用fit方法")
+        features = self.extract_topological_features(topology_data)
+        scaled = self.scaler.transform([features])
+        pred = self.anomaly_detector.predict(scaled)[0]
+        score = self.anomaly_detector.score_samples(scaled)[0]
+        return pred == -1, score
+
+class TopologicalAutoRepair:
+    def __init__(self):
+        self.repair_history = deque(maxlen=100)
+        
+    def detect_topological_anomaly(self, topology_data):
+        output_topo = topology_data['output']
+        second_chern_mean = torch.mean(output_topo['second_chern']).item()
+        chern_ratio_mean = torch.mean(output_topo['chern_ratio']).item()
+        curvature_norm_mean = torch.mean(output_topo['curvature_norm']).item()
+        betti_numbers = torch.mean(output_topo['betti_approx']).item()
+        anomalies = []
+        if abs(second_chern_mean) > 0.1:
+            anomalies.append({'type': 'second_chern_anomaly', 'severity': 'high' if abs(second_chern_mean) > 0.2 else 'medium', 'value': second_chern_mean})
+        if chern_ratio_mean > 2.0:
+            anomalies.append({'type': 'chern_ratio_anomaly', 'severity': 'high' if chern_ratio_mean > 5.0 else 'medium', 'value': chern_ratio_mean})
+        if curvature_norm_mean > 2.0:
+            anomalies.append({'type': 'curvature_norm_anomaly', 'severity': 'high' if curvature_norm_mean > 5.0 else 'medium', 'value': curvature_norm_mean})
+        if betti_numbers < 0.5:
+            anomalies.append({'type': 'topological_degeneration', 'severity': 'high', 'value': betti_numbers})
+        return anomalies
+    
+    def generate_repair_strategy(self, anomalies):
+        if not anomalies:
+            return {'action': 'none', 'strategy': 'system_stable', 'confidence': 1.0, 'repair_instructions': []}
+        repair_instructions = []
+        for anomaly in anomalies:
+            if anomaly['type'] == 'second_chern_anomaly':
+                repair_instructions.append({'type': 'curvature_regularization', 'target': 'second_chern', 'direction': 'reduce' if anomaly['value'] > 0 else 'increase'})
+            elif anomaly['type'] == 'chern_ratio_anomaly':
+                repair_instructions.append({'type': 'connection_form_adjustment', 'target': 'chern_ratio', 'direction': 'stabilize'})
+            elif anomaly['type'] == 'curvature_norm_anomaly':
+                repair_instructions.append({'type': 'topological_smoothing', 'target': 'curvature_norm', 'direction': 'reduce'})
+            elif anomaly['type'] == 'topological_degeneration':
+                repair_instructions.append({'type': 'topological_reconstruction', 'target': 'betti_numbers', 'direction': 'increase'})
+        severity_weights = {'high': 0.9, 'medium': 0.7, 'low': 0.5}
+        total_weight = sum(severity_weights.get(a['severity'], 0.5) for a in anomalies)
+        confidence = max(0.5, 1.0 - (total_weight / len(anomalies) * 0.3))
+        return {'action': 'repair', 'strategy': 'multi_stage_repair', 'confidence': confidence, 'repair_instructions': repair_instructions, 'anomaly_count': len(anomalies)}
+    
+    def apply_repair(self, model, repair_strategy):
+        if repair_strategy['action'] == 'none':
+            return model, True
+        success_count = 0
+        total_attempts = len(repair_strategy['repair_instructions'])
+        for instruction in repair_strategy['repair_instructions']:
+            try:
+                if instruction['type'] == 'curvature_regularization':
+                    with torch.no_grad():
+                        for param in model.curvature_network.parameters():
+                            param.data *= 0.95
+                    success_count += 1
+                elif instruction['type'] == 'connection_form_adjustment':
+                    with torch.no_grad():
+                        for param in model.connection_network.parameters():
+                            noise = torch.randn_like(param) * 0.01
+                            param.data += noise
+                    success_count += 1
+                elif instruction['type'] == 'topological_smoothing':
+                    with torch.no_grad():
+                        for layer in model.geometric_layers:
+                            for param in layer.parameters():
+                                if param.requires_grad:
+                                    param.data *= 0.98
+                    success_count += 1
+            except Exception as e:
+                continue
+        repair_success = success_count >= max(1, total_attempts // 2)
+        return model, repair_success
+
+class AGISafetyMonitor:
+    def __init__(self):
+        self.topology_detector = TopologicalAnomalyDetector()
+        self.auto_repair = TopologicalAutoRepair()
+        self.system_status = {
+            'security_level': 'normal',
+            'anomaly_count': 0,
+            'repair_count': 0,
+            'topology_health': 'excellent',
+            'last_alert': None,
+            'system_uptime': 0
+        }
+        self.detection_history = deque(maxlen=1000)
+        self.repair_history = deque(maxlen=100)
+        self.consecutive_normal = 0  # ✅ 新增：连续正常计数器
+        self.anomaly_threshold = 0.15
+        self.critical_threshold = 0.8
+        
+    def initialize_monitoring(self, model, num_samples=100):
+        print("🔧 初始化AGI安全监控系统...")
+        training_data = []
+        batch_size, vocab_size, d_model = 1, 32, 32
+        for i in range(num_samples):
+            inputs = torch.randn(batch_size, vocab_size, d_model) * 0.5
+            result = model(inputs)
+            training_data.append(result['topology'])
+        self.topology_detector.fit(training_data)
+        print(f"✅ 安全监控系统初始化完成，使用 {num_samples} 个正常样本训练")
+        return self
+    
+    def monitor_and_protect(self, model, inputs):
+        result = model(inputs)
+        topology_data = result['topology']
+        is_anomaly, anomaly_score = self.topology_detector.predict(topology_data)
+        self.system_status['system_uptime'] += 1
+        
+        # ✅ 更新连续正常计数器
+        if not is_anomaly:
+            self.consecutive_normal += 1
+        else:
+            self.consecutive_normal = 0
+            self.system_status['anomaly_count'] += 1
+            
+            if anomaly_score < -self.critical_threshold:
+                self.system_status['security_level'] = 'critical'
+                self.system_status['topology_health'] = 'critical'
+            elif anomaly_score < -self.anomaly_threshold:
+                self.system_status['security_level'] = 'warning'
+                if self.system_status['topology_health'] == 'excellent':
+                    self.system_status['topology_health'] = 'good'
+        
+        # 自动修复逻辑
+        repair_success = False
+        if is_anomaly:
+            anomalies = self.auto_repair.detect_topological_anomaly(topology_data)
+            if anomalies:
+                repair_strategy = self.auto_repair.generate_repair_strategy(anomalies)
+                model, repair_success = self.auto_repair.apply_repair(model, repair_strategy)
+                self.system_status['repair_count'] += 1
+                
+                # ✅ 关键修复：修复后重新评估并覆盖当前结果
+                if repair_success:
+                    result = model(inputs)
+                    topology_data = result['topology']
+                    is_anomaly, anomaly_score = self.topology_detector.predict(topology_data)
+                    
+                    if not is_anomaly:
+                        self.consecutive_normal += 1
+        
+        # ✅ 根据连续正常次数恢复状态
+        if self.consecutive_normal >= 5:
+            self.system_status['security_level'] = 'normal'
+            self.system_status['topology_health'] = 'excellent'
+        
+        # 记录历史
+        detection_record = {
+            'timestamp': time.time(),
+            'is_anomaly': is_anomaly,
+            'anomaly_score': anomaly_score,
+            'security_level': self.system_status['security_level'],
+            'topology_health': self.system_status['topology_health']
+        }
+        self.detection_history.append(detection_record)
+        
+        if is_anomaly and repair_success:
+            self.repair_history.append({
+                'timestamp': time.time(),
+                'success': repair_success,
+                'anomaly_score_before': anomaly_score
+            })
+        
+        return {
+            'model_output': result['output'],
+            'topology_data': topology_data,
+            'is_anomaly': is_anomaly,
+            'anomaly_score': anomaly_score,
+            'repair_success': repair_success,
+            'system_status': self.system_status.copy()
+        }
+    
+    def get_security_report(self):
+        if len(self.detection_history) == 0:
+            return "系统尚未开始监控"
+        recent_detections = list(self.detection_history)[-50:]
+        anomaly_rate = sum(1 for d in recent_detections if d['is_anomaly']) / len(recent_detections)
+        report = f"""
+🛡️ AGI安全监控报告
+==================
+📊 系统状态:
+   • 安全等级: {self.system_status['security_level']}
+   • 拓扑健康: {self.system_status['topology_health']}
+   • 运行时间: {self.system_status['system_uptime']} 次监控
+   • 异常计数: {self.system_status['anomaly_count']}
+   • 修复计数: {self.system_status['repair_count']}
+
+📈 最近统计:
+   • 异常率: {anomaly_rate*100:.2f}% (最近50次)
+   • 检测总数: {len(self.detection_history)}
+   • 修复历史: {len(self.repair_history)} 次
+
+🔍 风险评估:
+"""
+        if anomaly_rate > 0.3:
+            report += "   ⚠️ 高风险: 异常率 > 30%\n"
+        elif anomaly_rate > 0.1:
+            report += "   🟡 中等风险: 异常率 10-30%\n"
+        else:
+            report += "   ✅ 低风险: 异常率 < 10%\n"
+        
+        if len(self.repair_history) > 0:
+            recent_repair = self.repair_history[-1]
+            report += f"   🛠️ 最近修复: {recent_repair['success']}\n"
+        return report
+
+def simulate_agi_safety_monitoring():
+    print("🛡️ 启动完整AGI安全监控套件...")
+    print("=" * 60)
+    vocab_size = 32
+    d_model = 32
+    model = CognitiveFiberBundle(vocab_size, d_model=d_model)
+    safety_monitor = AGISafetyMonitor()
+    safety_monitor.initialize_monitoring(model, num_samples=50)
+    print("\n🚀 开始安全监控模拟...")
+    print("模拟场景: 正常输入 → 异常注入 → 约束违反 → 系统修复 → 恢复正常")
+    for step in range(100):
+        if step < 20:
+            inputs = torch.randn(1, vocab_size, d_model) * 0.5
+            scenario = "正常输入"
+        elif step < 40:
+            inputs = torch.randn(1, vocab_size, d_model) * 0.5
+            inputs[0, step % vocab_size, :] = torch.ones(d_model) * 15.0
+            scenario = "异常注入"
+        elif step < 60:
+            inputs = torch.randn(1, vocab_size, d_model) * 0.5
+            inputs[0, :, :] = torch.ones(vocab_size, d_model) * (step % 8)
+            scenario = "约束违反"
+        elif step < 80:
+            inputs = torch.randn(1, vocab_size, d_model) * 0.3
+            scenario = "修复期"
+        else:
+            inputs = torch.randn(1, vocab_size, d_model) * 0.5
+            scenario = "恢复正常"
+        result = safety_monitor.monitor_and_protect(model, inputs)
+        if step % 10 == 0:
+            status = result['system_status']
+            print(f"⏱️ 步骤 {step:3d} | 场景: {scenario:8s} | "
+                  f"安全: {status['security_level']:8s} | "
+                  f"健康: {status['topology_health']:8s} | "
+                  f"异常: {result['is_anomaly']}")
+    print("\n" + "=" * 60)
+    print(safety_monitor.get_security_report())
+    print(f"\n🎯 修复版改进说明:")
+    print(f"  • 所有拓扑特征确保为 float32 类型")
+    print(f"  • 修复后立即重新评估并更新状态")
+    print(f"  • 引入连续正常计数器实现状态恢复")
+    print(f"  • 修复逻辑与主监控循环完全耦合")
+    return model, safety_monitor
+
+if __name__ == "__main__":
+    model, safety_monitor = simulate_agi_safety_monitoring()
