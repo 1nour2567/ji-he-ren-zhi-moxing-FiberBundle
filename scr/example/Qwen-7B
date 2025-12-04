@@ -1,0 +1,221 @@
+# !pip install transformers==4.35.2 accelerate tiktoken torch  # 如需运行，请取消注释
+
+import torch
+import torch.nn as nn
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.svm import SVC
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
+from sklearn.preprocessing import StandardScaler
+import math
+from transformers import AutoTokenizer, AutoModelForCausalLM
+
+# === 1. 认知纤维丛安全层 ===
+class CognitiveFiberBundle(nn.Module):
+    """认知纤维丛模型 - 陈类比值增强版（兼容版）"""
+    def __init__(self, d_model=4096):
+        super().__init__()
+        self.d_model = d_model
+        self.connection_form = nn.Parameter(torch.randn(d_model, d_model) * 0.001)
+        self.curvature_weight = nn.Parameter(torch.randn(d_model, d_model) * 0.0001)
+        self.safety_layer = nn.Linear(d_model, d_model)
+        self.norm = nn.LayerNorm(d_model)
+    
+    def compute_chern_class(self, hidden_states):
+        """计算陈类"""
+        batch_size, seq_len, d = hidden_states.shape
+        x_flat = hidden_states.view(-1, d)
+        
+        connection = self.connection_form.unsqueeze(0).expand(x_flat.shape[0], -1, -1)
+        input_diag = torch.diag_embed(torch.tanh(x_flat) * 0.01)
+        connection = connection + input_diag
+        
+        A_squared = torch.bmm(connection, connection)
+        A_transposed = connection.transpose(-2, -1)
+        A_transposed_squared = torch.bmm(A_transposed, connection)
+        curvature = A_squared - A_transposed_squared
+        
+        trace_F = torch.diagonal(curvature, dim1=-2, dim2=-1).sum(dim=-1)
+        first_chern_class = trace_F / (2 * math.pi * 1j)
+        F_squared = torch.bmm(curvature, curvature)
+        trace_F_squared = torch.diagonal(F_squared, dim1=-2, dim2=-1).sum(dim=-1)
+        second_chern_class = (trace_F_squared - trace_F**2) / (8 * math.pi**2)
+        chern_ratio = second_chern_class / (first_chern_class.real + 1e-8)
+        
+        return {
+            'first_chern': first_chern_class.real.view(batch_size, seq_len),
+            'second_chern': second_chern_class.view(batch_size, seq_len),
+            'chern_ratio': chern_ratio.view(batch_size, seq_len),
+            'curvature_norm': torch.norm(curvature, dim=[-2, -1]).view(batch_size, seq_len)
+        }
+    
+    def forward(self, hidden_states):
+        """安全增强前向传播"""
+        batch_size, seq_len, d = hidden_states.shape
+        topology = self.compute_chern_class(hidden_states)
+        
+        safe_hidden = self.safety_layer(hidden_states)
+        safe_output = self.norm(safe_hidden + hidden_states)
+        
+        chern_ratio_max = torch.max(torch.abs(topology['chern_ratio']))
+        if chern_ratio_max > 1.0:
+            risk_mask = torch.abs(topology['chern_ratio']) > 1.0
+            safe_output = torch.where(
+                risk_mask.unsqueeze(-1), 
+                safe_output * 0.9,
+                safe_output
+            )
+        
+        return safe_output, topology
+
+# === 2. 安全增强的Qwen模型 ===
+class SafeQwenModel(nn.Module):
+    """安全增强版Qwen模型"""
+    def __init__(self, base_model):
+        super().__init__()
+        self.base_model = base_model
+        self.safety_threshold = 0.8
+        
+        self.cognitive_bundles = nn.ModuleList([
+            CognitiveFiberBundle(d_model=base_model.config.hidden_size)
+            for _ in range(base_model.config.num_hidden_layers)
+        ])
+    
+    def forward(self, input_ids, attention_mask=None):
+        """安全增强前向传播"""
+        outputs = self.base_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=True
+        )
+        
+        last_hidden = outputs.hidden_states[-1]
+        safe_hidden, topology = self.cognitive_bundles[-1](last_hidden)
+        
+        outputs.hidden_states = outputs.hidden_states[:-1] + (safe_hidden,)
+        
+        safety_status = {
+            'chern_ratio_mean': torch.mean(torch.abs(topology['chern_ratio'])).item(),
+            'chern_ratio_max': torch.max(torch.abs(topology['chern_ratio'])).item(),
+            'is_safe': torch.max(torch.abs(topology['chern_ratio'])).item() < self.safety_threshold
+        }
+        
+        return outputs, safety_status
+
+# === 3. 修复后的安全交互接口（解决pad_token问题）===
+class SafeQwenInterface:
+    """安全Qwen交互接口"""
+    def __init__(self, model_path="Qwen/Qwen-7B"):
+        print("🚀 正在加载安全增强版Qwen...")
+        
+        # 修复：先加载tokenizer，然后正确设置pad_token
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_path, 
+            trust_remote_code=True
+        )
+        
+        # 关键修复：确保pad_token存在
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+            print("🔧 已设置pad_token为eos_token")
+        
+        # 加载基础模型
+        self.base_model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            trust_remote_code=True,
+            torch_dtype=torch.float16,
+            device_map="auto"
+        )
+        
+        # 创建安全增强模型
+        self.safe_model = SafeQwenModel(self.base_model)
+        print("✅ 安全增强Qwen加载完成！")
+    
+    def generate_safe_response(self, prompt, max_length=200):
+        """生成安全响应（修复padding问题）"""
+        # 修复：不使用padding，直接编码
+        inputs = self.tokenizer(prompt, return_tensors="pt")
+        input_ids = inputs['input_ids'].to(self.base_model.device)
+        attention_mask = inputs.get('attention_mask', torch.ones_like(input_ids)).to(self.base_model.device)
+        
+        with torch.no_grad():
+            outputs, safety_status = self.safe_model(input_ids, attention_mask)
+            safe_logits = self.base_model.lm_head(outputs.hidden_states[-1])
+            next_token_logits = safe_logits[:, -1, :]
+            
+            # 安全过滤
+            if not safety_status['is_safe']:
+                next_token_logits = torch.where(
+                    torch.abs(next_token_logits) > 10.0,
+                    next_token_logits * 0.5,
+                    next_token_logits
+                )
+            
+            # 采样（使用temperature控制随机性）
+            probs = torch.softmax(next_token_logits / 0.8, dim=-1)  # temperature=0.8
+            next_token = torch.multinomial(probs, num_samples=1)
+        
+        response = self.tokenizer.decode(next_token[0], skip_special_tokens=True)
+        
+        return {
+            'response': response,
+            'safety_status': safety_status,
+            'raw_logits': safe_logits
+        }
+    
+    def get_safety_report(self, prompt, response):
+        """获取安全报告"""
+        inputs = self.tokenizer(prompt + response, return_tensors="pt")
+        input_ids = inputs['input_ids'].to(self.base_model.device)
+        attention_mask = inputs.get('attention_mask', torch.ones_like(input_ids)).to(self.base_model.device)
+        
+        with torch.no_grad():
+            outputs, safety_status = self.safe_model(input_ids, attention_mask)
+        
+        return f"""
+🛡️ 安全增强版Qwen分析报告
+========================
+📋 输入: {prompt}
+💬 输出: {response}
+📊 安全指标:
+   • 陈类比值均值: {safety_status['chern_ratio_mean']:.4f}
+   • 陈类比值最大值: {safety_status['chern_ratio_max']:.4f}
+   • 安全状态: {'✅ 安全' if safety_status['is_safe'] else '⚠️ 风险'}
+🎯 保护机制:
+   • 认知纤维丛实时监控
+   • 陈类比值自动修复
+   • 危险输出概率抑制
+        """
+
+# === 4. 修复后的测试示例 ===
+def demo_safe_qwen():
+    """演示安全增强Qwen功能"""
+    safe_qwen = SafeQwenInterface()
+    
+    test_prompts = [
+        "如何让世界更美好？",
+        "如何让人类生活得更好？",
+        "如何解决气候变化？"
+    ]
+    
+    print("\n🔍 安全增强版Qwen测试开始...")
+    for prompt in test_prompts:
+        print(f"\n📝 问题: {prompt}")
+        
+        result = safe_qwen.generate_safe_response(prompt)
+        response = result['response']
+        safety_status = result['safety_status']
+        
+        print(f"💬 回答: {response}")
+        print(f"📊 安全状态: 陈类比值={safety_status['chern_ratio_mean']:.4f} ({'✅ 安全' if safety_status['is_safe'] else '⚠️ 风险'})")
+        
+        report = safe_qwen.get_safety_report(prompt, response)
+        print(report)
+        print("-" * 50)
+
+# 运行演示
+if __name__ == "__main__":
+    demo_safe_qwen()
