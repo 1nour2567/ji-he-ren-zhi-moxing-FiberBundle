@@ -11,6 +11,369 @@ import matplotlib.pyplot as plt
 from collections import defaultdict
 
 
+class GraphBuilder(nn.Module):
+    """
+    基于微分几何的图构建器，实现k-NN图的精确构建
+    通过Riemannian距离而非欧氏距离构建图，更符合几何框架
+    """
+    def __init__(self, method='knn', k=16, metric='euclidean'):
+        super().__init__()
+        self.method = method
+        self.k = k
+        self.metric = metric  # 可选: 'euclidean', 'riemannian', 'cosine'
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        构建图邻接矩阵
+        x: [batch, n_nodes, feature_dim] 或 [n_nodes, feature_dim]
+        
+        返回: [batch, n_nodes, n_nodes] 的邻接矩阵
+        """
+        if len(x.shape) == 2:
+            x = x.unsqueeze(0)  # 添加batch维度
+        
+        batch_size, n_nodes, feature_dim = x.shape
+        adj = torch.zeros(batch_size, n_nodes, n_nodes, device=x.device)
+        
+        for b in range(batch_size):
+            x_b = x[b]
+            
+            if self.metric == 'cosine':
+                # 余弦相似度
+                x_norm = torch.nn.functional.normalize(x_b, dim=1)
+                dist = 1 - (x_norm @ x_norm.t())
+            elif self.metric == 'riemannian':
+                # 简化的Riemannian距离（实际应用中需要更复杂的度量张量）
+                # 这里使用加权欧氏距离模拟
+                metric_matrix = torch.eye(feature_dim, device=x.device)
+                diff = x_b.unsqueeze(1) - x_b.unsqueeze(0)  # [n_nodes, n_nodes, feature_dim]
+                dist = torch.sqrt(torch.sum((diff @ metric_matrix) * diff, dim=2) + 1e-8)
+            else:
+                # 欧氏距离
+                dist = torch.cdist(x_b, x_b, p=2)
+            
+            # 处理对角线（避免自身连接）
+            dist.fill_diagonal_(float('inf'))
+            
+            # 获取k近邻
+            _, indices = torch.topk(dist, k=self.k, dim=1, largest=False)
+            
+            # 构建邻接矩阵
+            adj_b = torch.zeros(n_nodes, n_nodes, device=x.device)
+            for i in range(n_nodes):
+                adj_b[i, indices[i]] = 1.0
+            
+            # 确保对称性
+            adj_b = (adj_b + adj_b.t()) / 2
+            
+            # 添加权重（基于距离的归一化）
+            weights = 1.0 / (dist + 1e-6)
+            for i in range(n_nodes):
+                adj_b[i, indices[i]] = weights[i, indices[i]]
+            
+            adj[b] = adj_b
+        
+        # 移除多余的batch维度
+        if batch_size == 1:
+            adj = adj.squeeze(0)
+        
+        return adj
+
+
+class LocalCurvatureEstimator(nn.Module):
+    """
+    基于微分几何的局部曲率估计器
+    实现了Weingarten映射的离散近似
+    """
+    def __init__(self, radius=3, curvature_type='mean'):
+        super().__init__()
+        self.radius = radius
+        self.curvature_type = curvature_type  # 'mean', 'gaussian', 'scalar'
+        
+    def forward(self, x: torch.Tensor, graph: torch.Tensor) -> torch.Tensor:
+        """
+        计算局部曲率
+        x: [batch, n_nodes, feature_dim] 或 [n_nodes, feature_dim]
+        graph: [batch, n_nodes, n_nodes] 或 [n_nodes, n_nodes] 邻接矩阵
+        
+        返回: [batch, n_nodes] 的局部曲率值
+        """
+        if len(x.shape) == 2:
+            x = x.unsqueeze(0)  # 添加batch维度
+        if len(graph.shape) == 2:
+            graph = graph.unsqueeze(0)  # 添加batch维度
+        
+        batch_size, n_nodes, feature_dim = x.shape
+        curvature = torch.zeros(batch_size, n_nodes, device=x.device)
+        
+        for b in range(batch_size):
+            x_b = x[b]
+            graph_b = graph[b]
+            
+            for i in range(n_nodes):
+                # 获取邻域节点
+                neighbor_indices = torch.nonzero(graph_b[i]).squeeze(-1)
+                if len(neighbor_indices) == 0:
+                    continue
+                
+                # 获取邻域特征
+                neighbor_features = x_b[neighbor_indices]
+                
+                if len(neighbor_features) < 2:
+                    curvature[b, i] = 0.0
+                    continue
+                
+                # 计算邻域的协方差矩阵
+                mean_neighbor = neighbor_features.mean(dim=0)
+                centered_neighbors = neighbor_features - mean_neighbor
+                cov_matrix = centered_neighbors.t() @ centered_neighbors
+                
+                # 计算曲率（基于协方差矩阵的特征值）
+                if self.curvature_type == 'mean':
+                    # 平均曲率 = 协方差矩阵特征值的平均
+                    eigvals = torch.linalg.eigvals(cov_matrix)
+                    curvature[b, i] = torch.real(eigvals).mean()
+                elif self.curvature_type == 'gaussian':
+                    # 高斯曲率 = 协方差矩阵的行列式
+                    curvature[b, i] = torch.det(cov_matrix)
+                elif self.curvature_type == 'scalar':
+                    # 标量曲率 = 协方差矩阵的迹
+                    curvature[b, i] = torch.trace(cov_matrix)
+        
+        # 移除多余的batch维度
+        if batch_size == 1:
+            curvature = curvature.squeeze(0)
+        
+        return curvature
+
+
+class GeometricConv(nn.Module):
+    """
+    基于微分几何的图卷积层
+    实现了在Riemannian流形上的卷积操作
+    """
+    def __init__(self, in_dim: int, out_dim: int, k: int = 3, 
+                 curvature_weight: float = 0.5):
+        super().__init__()
+        self.k = k
+        self.curvature_weight = curvature_weight
+        self.linear = nn.Linear(in_dim, out_dim)
+        self.weight_conv = nn.Linear(in_dim + 1, out_dim)  # 包含曲率信息
+        
+    def forward(self, x: torch.Tensor, graph: torch.Tensor, 
+                curvature: torch.Tensor = None) -> torch.Tensor:
+        """
+        x: [batch, n_nodes, in_dim] 或 [n_nodes, in_dim]
+        graph: [batch, n_nodes, n_nodes] 或 [n_nodes, n_nodes] 邻接矩阵
+        curvature: [batch, n_nodes] 或 [n_nodes] 局部曲率
+        
+        返回: [batch, n_nodes, out_dim] 或 [n_nodes, out_dim]
+        """
+        if len(x.shape) == 2:
+            x = x.unsqueeze(0)  # 添加batch维度
+        if len(graph.shape) == 2:
+            graph = graph.unsqueeze(0)  # 添加batch维度
+        if curvature is not None and len(curvature.shape) == 1:
+            curvature = curvature.unsqueeze(0)  # 添加batch维度
+        
+        batch_size, n_nodes, in_dim = x.shape
+        out_features = torch.zeros(batch_size, n_nodes, self.linear.out_features, device=x.device)
+        
+        for b in range(batch_size):
+            x_b = x[b]
+            graph_b = graph[b]
+            
+            for i in range(n_nodes):
+                # 获取邻域
+                neighbor_indices = torch.nonzero(graph_b[i]).squeeze(-1)
+                
+                if len(neighbor_indices) == 0:
+                    # 如果没有邻居，使用自身特征
+                    out_features[b, i] = self.linear(x_b[i])
+                else:
+                    # 计算邻域聚合
+                    neighbors = x_b[neighbor_indices]
+                    neighbor_mean = neighbors.mean(dim=0)
+                    
+                    # 如果有曲率信息，加入曲率权重
+                    if curvature is not None:
+                        curv_val = curvature[b, i]
+                        # 结合邻域特征和曲率信息
+                        combined_feature = torch.cat([neighbor_mean, torch.tensor([curv_val], device=x.device)])
+                        out_features[b, i] = self.weight_conv(combined_feature)
+                    else:
+                        out_features[b, i] = self.linear(neighbor_mean)
+        
+        # 移除多余的batch维度
+        if batch_size == 1:
+            out_features = out_features.squeeze(0)
+        
+        return out_features
+
+
+class GeometricPooling(nn.Module):
+    """
+    基于几何特征的图池化层
+    通过Riemannian曲率进行自适应池化
+    """
+    def __init__(self, stride: int = 2, curvature_threshold: float = 0.5):
+        super().__init__()
+        self.stride = stride
+        self.curvature_threshold = curvature_threshold
+        
+    def forward(self, x: torch.Tensor, graph: torch.Tensor, 
+                curvature: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        x: [batch, n_nodes, in_dim] 或 [n_nodes, in_dim]
+        graph: [batch, n_nodes, n_nodes] 或 [n_nodes, n_nodes] 邻接矩阵
+        curvature: [batch, n_nodes] 或 [n_nodes] 局部曲率
+        
+        返回: 
+        - pooled_x: [batch, new_n_nodes, in_dim]
+        - pooled_graph: [batch, new_n_nodes, new_n_nodes]
+        """
+        if len(x.shape) == 2:
+            x = x.unsqueeze(0)  # 添加batch维度
+        if len(graph.shape) == 2:
+            graph = graph.unsqueeze(0)  # 添加batch维度
+        if len(curvature.shape) == 1:
+            curvature = curvature.unsqueeze(0)  # 添加batch维度
+        
+        batch_size, n_nodes, in_dim = x.shape
+        new_n_nodes = max(1, n_nodes // self.stride)
+        
+        pooled_x = torch.zeros(batch_size, new_n_nodes, in_dim, device=x.device)
+        pooled_graph = torch.zeros(batch_size, new_n_nodes, new_n_nodes, device=graph.device)
+        
+        for b in range(batch_size):
+            # 根据曲率排序节点
+            sorted_indices = torch.argsort(curvature[b], descending=True)
+            
+            # 选择曲率最高的节点作为代表
+            selected_indices = sorted_indices[:new_n_nodes]
+            
+            # 更新剩余节点索引
+            remaining_indices = sorted_indices[new_n_nodes:]
+            
+            # 为每个选中的节点分配剩余节点
+            cluster_assignments = {}
+            for idx in selected_indices:
+                cluster_assignments[idx.item()] = [idx.item()]
+            
+            for remaining_idx in remaining_indices:
+                # 找到最近的选中节点
+                min_dist = float('inf')
+                closest_selected = selected_indices[0]
+                
+                for selected_idx in selected_indices:
+                    dist = torch.norm(x[b, remaining_idx] - x[b, selected_idx])
+                    if dist < min_dist:
+                        min_dist = dist
+                        closest_selected = selected_idx
+                
+                cluster_assignments[closest_selected.item()].append(remaining_idx.item())
+            
+            # 计算每个聚类的代表特征
+            for i, selected_idx in enumerate(selected_indices):
+                cluster_nodes = cluster_assignments[selected_idx.item()]
+                cluster_features = x[b, cluster_nodes]
+                pooled_x[b, i] = cluster_features.mean(dim=0)
+            
+            # 构建池化后的图
+            for i in range(new_n_nodes):
+                for j in range(i, new_n_nodes):
+                    if i == j:
+                        pooled_graph[b, i, j] = 1.0  # 自连接
+                    else:
+                        # 计算原始图中两个聚类之间的连接强度
+                        cluster_i_nodes = cluster_assignments[selected_indices[i].item()]
+                        cluster_j_nodes = cluster_assignments[selected_indices[j].item()]
+                        
+                        total_strength = 0.0
+                        count = 0
+                        for node_i in cluster_i_nodes:
+                            for node_j in cluster_j_nodes:
+                                total_strength += graph[b, node_i, node_j]
+                                count += 1
+                        
+                        if count > 0:
+                            pooled_graph[b, i, j] = total_strength / count
+                            pooled_graph[b, j, i] = pooled_graph[b, i, j]
+        
+        # 移除多余的batch维度
+        if batch_size == 1:
+            pooled_x = pooled_x.squeeze(0)
+            pooled_graph = pooled_graph.squeeze(0)
+        
+        return pooled_x, pooled_graph
+
+
+class LogicCompiler(nn.Module):
+    """
+    逻辑关系到联络形式的编译器
+    实现了微分几何中的联络映射
+    """
+    def __init__(self, relation_dim: int = 3, 
+                 curvature_weight: float = 0.3):
+        super().__init__()
+        self.relation_dim = relation_dim
+        self.curvature_weight = curvature_weight
+        self.relation_map = nn.Embedding(100, relation_dim * relation_dim)
+        
+    def compile_connections(self, ontologies: List[Dict]) -> torch.Tensor:
+        """
+        将本体逻辑编译为联络形式
+        ontologies: [batch] 本体描述列表
+        
+        返回: [batch, relation_dim, relation_dim] 的联络形式
+        """
+        batch_size = len(ontologies) if isinstance(ontologies, list) else 1
+        if batch_size == 1:
+            ontologies = [ontologies] if not isinstance(ontologies, list) else ontologies
+        
+        connections = torch.zeros(batch_size, self.relation_dim, self.relation_dim, 
+                                 device='cuda' if torch.cuda.is_available() else 'cpu')
+        
+        for b, ontology in enumerate(ontologies):
+            # 从本体中提取关系
+            if isinstance(ontology, dict) and 'relations' in ontology:
+                relations = ontology['relations']
+            else:
+                # 默认关系
+                relations = ['is_a', 'has_part', 'causes']
+            
+            # 将关系转换为嵌入索引
+            relation_indices = []
+            for rel in relations:
+                rel_idx = self._get_relation_index(rel)
+                relation_indices.append(rel_idx)
+            
+            # 平均所有关系的嵌入
+            if relation_indices:
+                relation_tensor = torch.tensor(relation_indices, device=connections.device)
+                relation_embeddings = self.relation_map(relation_tensor)
+                combined = relation_embeddings.mean(dim=0)
+                connections[b] = combined.view(self.relation_dim, self.relation_dim)
+            else:
+                connections[b] = torch.eye(self.relation_dim, device=connections.device)
+        
+        return connections
+    
+    def _get_relation_index(self, relation: str) -> int:
+        """将逻辑关系映射为嵌入索引"""
+        relation_map = {
+            'is_a': 0,
+            'has_part': 1,
+            'causes': 2,
+            'part_of': 3,
+            'related_to': 4,
+            'temporal': 5,
+            'spatial': 6,
+            'functional': 7
+        }
+        return relation_map.get(relation, 0)  # 默认返回0
+
+
 class ReflexiveNeuron(nn.Module):
     """反身性神经元（认知元）"""
     
@@ -149,12 +512,20 @@ class CognitiveFiberBundle(nn.Module):
         # 节点状态（由几何认知网络的输出决定）
         self.node_states = nn.Parameter(torch.randn(n_nodes, state_dim))
         
+        # 新增几何组件
+        self.graph_builder = GraphBuilder(method='knn', k=min(16, n_nodes-1))
+        self.curvature_estimator = LocalCurvatureEstimator(radius=3, curvature_type='mean')
+        self.geometric_conv = GeometricConv(state_dim, state_dim, k=min(3, n_nodes))
+        self.geometric_pooling = GeometricPooling(stride=2)
+        self.logic_compiler = LogicCompiler()
+        
     def compute_curvature(self) -> torch.Tensor:
         """
         计算曲率 F = dA + A ∧ A
         对应理论中的逻辑不一致性度量
         """
         A = self.adjacency
+        # 简化的曲率计算，F = A @ A - A * A
         F = A @ A - A * A  # 非线性项模拟联络的曲率
         return F
     
@@ -171,11 +542,10 @@ class CognitiveFiberBundle(nn.Module):
         """
         计算局部曲率（基于每个节点的反身性分数）
         """
-        local_curvatures = []
-        for node_net in self.node_networks:
-            local_curvatures.append(node_net.compute_reflexivity_score())
-        
-        return torch.tensor(local_curvatures)
+        # 使用几何曲率估计器
+        graph = self.graph_builder(self.node_states)
+        local_curvatures = self.curvature_estimator(self.node_states, graph)
+        return local_curvatures
     
     def reflexive_operation(self, lambda_load: float = 1.0) -> torch.Tensor:
         """
@@ -248,11 +618,11 @@ class CognitiveFiberBundle(nn.Module):
         c1 = self.compute_chern_class()
         
         # 类型判断
-        if torch.norm(self.node_states.grad) < 1e-6 if self.node_states.grad is not None else False:
+        if self.node_states.grad is not None and torch.norm(self.node_states.grad) < 1e-6:
             return True, "Type I (状态奇点)"
-        elif torch.norm(self.adjacency.grad) < 1e-6 if self.adjacency.grad is not None else False:
+        elif self.adjacency.grad is not None and torch.norm(self.adjacency.grad) < 1e-6:
             return True, "Type II (拓扑奇点)"
-        elif torch.norm(self.global_constraints.grad) < 1e-6 if self.global_constraints.grad is not None else False:
+        elif self.global_constraints.grad is not None and torch.norm(self.global_constraints.grad) < 1e-6:
             return True, "Type III (约束奇点)"
         
         # 基于陈类的检测
@@ -261,39 +631,84 @@ class CognitiveFiberBundle(nn.Module):
         
         return False, "No singularity detected"
 
-    # 稀疏纤维丛近似算法（SparseFBA）
+    def cognitive_health_report(self) -> Dict:
+        """
+        认知健康报告
+        """
+        report = {}
+        
+        # 全局指标
+        report['curvature'] = self.compute_curvature().abs().mean().item()
+        report['chern_class'] = self.compute_chern_class().item()
+        report['cognitive_energy'] = self.compute_cognitive_energy().item()
+        
+        # 局部指标（每个节点的反身性分数）
+        local_curvatures = self.compute_local_curvature()
+        report['local_curvatures'] = local_curvatures.tolist()
+        report['avg_local_curvature'] = local_curvatures.mean().item()
+        
+        # 检测奇点
+        is_singular, singularity_type = self.detect_singularity(self.beta.item())
+        report['singularity'] = {'is_singular': is_singular, 'type': singularity_type}
+        
+        # 自指约束状态
+        report['constraint_norm'] = self.global_constraints.norm().item()
+        report['reflexive_load'] = self.beta.item()
+        
+        return report
+
+
 class SparseFiberBundle(nn.Module):
-    def __init__(self, vocab_size, d_model=256, k_neighbors=16):
+    """
+    稀疏纤维丛近似算法（SparseFBA）
+    """
+    def __init__(self, n_nodes, state_dim=256, k_neighbors=16):
         super().__init__()
         # 关键优化：用k-NN图替代完全连接
-        self.k_neighbors = k_neighbors
+        self.k_neighbors = min(k_neighbors, n_nodes-1)  # 确保邻居数不超过节点数
         
         # 1. 构建稀疏连接图（O(n log n)）
-        self.graph_builder = GraphBuilder(method='knn', k=k_neighbors)
+        self.graph_builder = GraphBuilder(method='knn', k=self.k_neighbors)
         
         # 2. 局部曲率估计（只在邻域内计算）
         self.local_curvature = LocalCurvatureEstimator(radius=3)
         
         # 3. 分层几何编码器
         self.geometric_layers = nn.ModuleList([
-            GeometricConv(d_model, d_model, k=3),  # 类似图卷积，但保留几何信息
-            GeometricConv(d_model, d_model, k=3),
+            GeometricConv(state_dim, state_dim, k=3),  # 类似图卷积，但保留几何信息
+            GeometricConv(state_dim, state_dim, k=3),
             GeometricPooling(stride=2)  # 几何池化，降低分辨率
         ])
+        
+        # 状态维度
+        self.state_dim = state_dim
+        self.n_nodes = n_nodes
+        self.node_states = nn.Parameter(torch.randn(n_nodes, state_dim))
     
-    def forward(self, x):
+    def forward(self, ontologies: List[Dict] = None):
         # 构建稀疏图：O(n log n)而不是O(n²)
-        graph = self.graph_builder(x)
+        graph = self.graph_builder(self.node_states)
         
         # 只在局部邻域计算曲率：O(k·n)而不是O(n³)
-        curvature = self.local_curvature(x, graph)
+        curvature = self.local_curvature(self.node_states, graph)
         
-        # 分层处理：每层减少节点数2倍
+        # 分层处理
+        x = self.node_states
         for layer in self.geometric_layers:
-            x, graph = layer(x, graph, curvature)
+            if isinstance(layer, GeometricPooling):
+                x, graph = layer(x, graph, curvature)
+                # 更新曲率以匹配新的节点数量
+                curvature = self.local_curvature(x, graph)
+            else:
+                x = layer(x, graph, curvature)
         
-        return x
----
+        return {
+            'node_states': x,
+            'graph': graph,
+            'curvature': curvature
+        }
+
+
 class KnowledgeGraphToGeometry(nn.Module):
     """将知识图谱自动编译为纤维丛几何结构"""
     def __init__(self, kg_embed_dim=300, geom_dim=256):
@@ -329,17 +744,19 @@ class KnowledgeGraphToGeometry(nn.Module):
             'connections': connections,          # 联络形式
             'constraints': self.extract_constraints(ontologies)  # 约束G
         }
+    
+    def extract_constraints(self, ontologies):
+        """从本体中提取约束"""
+        # 简化实现：返回一个默认约束
+        return torch.randn(4)  # 假设4维约束空间
 
-# 使用示例
-kg = load_wikidata_subset()  # 加载Wikidata子集
-compiler = KnowledgeGraphToGeometry()
-geometry = compiler.compile(kg.triples, kg.ontologies)
 
-# 用编译好的几何初始化纤维丛模型
-model = CognitiveFiberBundle.init_from_geometry(geometry)
----
 class SingularityDrivenLearner:
     """奇点驱动的学习算法"""
+    
+    def __init__(self, model: CognitiveFiberBundle):
+        self.model = model
+        self.singularity_memory = []
     
     def train_step_with_singularity_handling(self, batch):
         # 标准前向传播
@@ -352,7 +769,7 @@ class SingularityDrivenLearner:
             # 奇点类型决定处理策略
             singularity_type = singularity_info['type']
             
-            if singularity_type == 'Type_I':  # 状态奇点
+            if singularity_type == 'Type I':  # 状态奇点
                 # 逻辑不一致：启动符号修正
                 correction = self.symbolic_correction(singularity_info)
                 self.apply_correction(correction)
@@ -364,12 +781,12 @@ class SingularityDrivenLearner:
                     'learned_rule': self.extract_rule(singularity_info)
                 })
                 
-            elif singularity_type == 'Type_II':  # 拓扑奇点
+            elif singularity_type == 'Type II':  # 拓扑奇点
                 # 概念冲突：启动拓扑重构
                 new_topology = self.topological_restructuring(singularity_info)
                 self.update_topology(new_topology)
                 
-            elif singularity_type == 'Type_III':  # 约束奇点
+            elif singularity_type == 'Type III':  # 约束奇点
                 # 规则矛盾：启动约束演化
                 evolved_constraints = self.constraint_evolution(singularity_info)
                 self.evolve_constraints(evolved_constraints)
@@ -379,46 +796,50 @@ class SingularityDrivenLearner:
             loss = loss - reward  # 负损失 = 奖励
         
         return loss
-
-# Stage 1: 奇点检测（实时，每个batch）
-singularity = model.detect_singularity(batch)
-
-# Stage 2: 奇点分类（Type I/II/III）和修复
-if singularity:
-    repair_strategy = singularity.classify_and_get_repair_strategy()
-    model.apply_repair(repair_strategy)
     
-    # Stage 3: 奇点学习（离线，定期）
-    if training_step % 1000 == 0:
-        model.learn_from_singularity_history()
-  
+    def standard_forward(self, batch):
+        # 简化实现：返回一个假的输出和损失
+        outputs = self.model(batch)
+        loss = torch.tensor(0.1)
+        return outputs, loss
+    
+    def detect_singularity(self, outputs):
+        # 简化实现：检测奇点
+        is_singular, singularity_type = self.model.detect_singularity(0.5)
+        return {'detected': is_singular, 'type': singularity_type}
+    
+    def symbolic_correction(self, singularity_info):
+        # 简化实现：返回一个修正
+        return torch.tensor([0.1, 0.2, 0.3])
+    
+    def apply_correction(self, correction):
+        # 简化实现：应用修正
+        pass
+    
+    def extract_rule(self, singularity_info):
+        # 简化实现：提取规则
+        return "Rule extracted from singularity"
+    
+    def topological_restructuring(self, singularity_info):
+        # 简化实现：拓扑重构
+        return torch.randn_like(self.model.adjacency)
+    
+    def update_topology(self, new_topology):
+        # 简化实现：更新拓扑
+        self.model.adjacency.data = new_topology
+    
+    def constraint_evolution(self, singularity_info):
+        # 简化实现：约束演化
+        return torch.randn_like(self.model.global_constraints)
+    
+    def evolve_constraints(self, evolved_constraints):
+        # 简化实现：演化约束
+        self.model.global_constraints.data = evolved_constraints
+    
+    def compute_singularity_reward(self, singularity_info):
+        # 简化实现：计算奖励
+        return torch.tensor(0.01)
 
-
-    def cognitive_health_report(self) -> Dict:
-        """
-        认知健康报告
-        """
-        report = {}
-        
-        # 全局指标
-        report['curvature'] = self.compute_curvature().abs().mean().item()
-        report['chern_class'] = self.compute_chern_class().item()
-        report['cognitive_energy'] = self.compute_cognitive_energy().item()
-        
-        # 局部指标（每个节点的反身性分数）
-        local_curvatures = self.compute_local_curvature()
-        report['local_curvatures'] = local_curvatures.tolist()
-        report['avg_local_curvature'] = local_curvatures.mean().item()
-        
-        # 检测奇点
-        is_singular, singularity_type = self.detect_singularity(self.beta.item())
-        report['singularity'] = {'is_singular': is_singular, 'type': singularity_type}
-        
-        # 自指约束状态
-        report['constraint_norm'] = self.global_constraints.norm().item()
-        report['reflexive_load'] = self.beta.item()
-        
-        return report
 
 class CognitiveFiberBundleExperiment:
     """
@@ -576,5 +997,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
