@@ -603,8 +603,11 @@ class CognitiveFiberBundle(nn.Module):
         
         # Hebbian学习规则更新连接权重
         with torch.no_grad():
-            hebbian_update = torch.outer(self.node_states.mean(dim=0), 
-                                        self.node_states.mean(dim=0))
+            # 修复维度错误：使用节点状态的平均值来构建连接矩阵
+            node_mean = self.node_states.mean(dim=1)  # [n_nodes]
+            # 构建外积矩阵 [n_nodes, n_nodes]
+            hebbian_update = torch.outer(node_mean, node_mean)
+            
             decay = self.alpha * self.adjacency
             reflexive_update = self.beta * self.global_constraints.mean() * torch.sigmoid(self.adjacency)
             
