@@ -1,0 +1,288 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+import math
+from torch.nn import TransformerEncoder, TransformerEncoderLayer
+from torch.utils.data import Dataset, DataLoader
+from typing import List, Tuple
+import higher # 用于MAML的二阶优化
+
+# 设备管理
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"使用设备: {device}")
+
+# --- 1. 基础组件 ---
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
+        position = torch.arange(max_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
+        pe = torch.zeros(max_len, 1, d_model)
+        pe[:, 0, 0::2] = torch.sin(position * div_term)
+        pe[:, 0, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        x = x + self.pe[:x.size(0)]
+        return self.dropout(x)
+
+class DynamicAxiomTransformer(nn.Module):
+    """
+    基础Transformer模型，包含一个可学习的公理记忆池 (Axiom Memory Pool)。
+    """
+    def __init__(self, ntoken: int, d_model: int, nhead: int, d_hid: int,
+                 nlayers: int, dropout: float = 0.1, max_axioms: int = 100):
+        super().__init__()
+        self.d_model = d_model
+        self.pos_encoder = PositionalEncoding(d_model, dropout)
+        encoder_layers = TransformerEncoderLayer(d_model, nhead, d_hid, dropout, batch_first=True)
+        self.transformer_encoder = TransformerEncoder(encoder_layers, nlayers)
+        self.encoder = nn.Embedding(ntoken, d_model)
+        
+        # 核心组件：可学习的公理记忆池
+        self.axiom_memory_pool = nn.Parameter(torch.randn(max_axioms, d_model)) 
+        self.axiom_attention = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+        
+        self.decoder = nn.Linear(d_model, ntoken)
+        self.init_weights()
+
+    def init_weights(self):
+        initrange = 0.1
+        self.encoder.weight.data.uniform_(-initrange, initrange)
+        self.decoder.bias.data.zero_()
+        self.decoder.weight.data.uniform_(-initrange, initrange)
+
+    def forward(self, src: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        前向传播
+        返回：(logits, attended_axioms)
+        """
+        src_embed = self.encoder(src) * math.sqrt(self.d_model)
+        src_embed = self.pos_encoder(src_embed)
+        
+        # 公理记忆池注意力机制
+        batch_size = src.size(0)
+        # 扩展公理池，使其适应批次大小 [A, D] -> [B, A, D]
+        axiom_memory = self.axiom_memory_pool.unsqueeze(0).expand(batch_size, -1, -1)
+        
+        # Q=输入 (src), K/V=公理池 (axiom_memory)
+        attended_axioms, _ = self.axiom_attention(src_embed, axiom_memory, axiom_memory)
+        
+        # 将公理信息融入序列表示
+        combined = src_embed + attended_axioms
+        
+        output = self.transformer_encoder(combined)
+        logits = self.decoder(output)
+        
+        return logits, attended_axioms # 返回聚合后的公理表示
+
+# --- 2. 拓扑约束损失函数 ---
+
+def compute_enhanced_topological_loss(axiom_memory_pool: torch.Tensor) -> torch.Tensor:
+    """
+    增强版拓扑损失：强制公理记忆池中的向量保持一定的拓扑结构。
+    我们鼓励适中距离（防止过度聚集和过度发散），以近似Betti数中的环路/空洞结构。
+    
+    参数:
+        axiom_memory_pool: 公理记忆参数，形状为 [A, D] 或 [1, A, D]
+    返回:
+        L_topology: 拓扑损失标量
+    """
+    if axiom_memory_pool.dim() == 3:
+        axiom_memory_pool = axiom_memory_pool.squeeze(0) # [1, A, D] -> [A, D]
+        
+    N, D = axiom_memory_pool.shape
+    
+    if N < 2:
+        return torch.tensor(0.0, device=axiom_memory_pool.device, requires_grad=True)
+
+    # 1. 计算距离矩阵 (Dists)
+    dists = torch.cdist(axiom_memory_pool, axiom_memory_pool, p=2) # [N, N]
+    
+    # 提取非对角线距离
+    eye_mask = torch.eye(N, device=dists.device).bool()
+    off_diag_dists = dists[~eye_mask] 
+
+    # 归一化距离
+    max_d = off_diag_dists.max().detach()
+    norm_dists = off_diag_dists / (max_d + 1e-8)
+
+    # 2. L_separation (鼓励稀疏连接和多样性，惩罚过度聚集)
+    # 使用 -log(d) 惩罚过小的距离 d
+    L_sep = -torch.log(norm_dists + 1e-6).mean() * 0.05
+    
+    # 3. L_compactness (惩罚过度发散) - L2范数
+    L_compact = torch.norm(axiom_memory_pool, p=2).mean() * 0.01
+
+    # L_topology 旨在鼓励公理记忆池形成具有结构化的流形（例如，持续同调中的环路）
+    L_topology = L_sep + L_compact
+    
+    return L_topology
+
+# --- 3. 拓扑引导元学习模型 (TG-MLM) ---
+
+class TopologyGuidedMetaLearningModel(nn.Module):
+    """
+    拓扑引导元学习模型 (TG-MLM)
+    使用MAML框架，并在内部适应过程中加入拓扑损失。
+    """
+    def __init__(self, base_model: DynamicAxiomTransformer, inner_lr: float = 1e-3):
+        super().__init__()
+        self.base_model = base_model
+        self.inner_lr = inner_lr
+        # 元优化器：更新base_model的参数（包括axiom_memory_pool）
+        self.meta_optimizer = optim.Adam(self.base_model.parameters(), lr=1e-3) 
+        self.loss_fn = nn.CrossEntropyLoss()
+
+    def meta_train_step(self, task_batch: Dict, inner_steps: int = 5):
+        """
+        执行一次元学习更新 (外循环)
+        """
+        support_set, query_set = task_batch['support'], task_batch['query']
+        
+        # 获取支持集和查询集数据
+        support_input, support_target = support_set[0].to(device).squeeze(0), support_set[1].to(device).squeeze(0)
+        query_input, query_target = query_set[0].to(device).squeeze(0), query_set[1].to(device).squeeze(0)
+        
+        # 内循环：任务适应 (使用higher库进行二阶微分)
+        with higher.innerloop_ctx(self.base_model, self.meta_optimizer, copy_initial_weights=False) as (fmodel, diffopt):
+            
+            # 内部适应：计算任务损失和拓扑损失
+            for i in range(inner_steps):
+                logits, _ = fmodel(support_input)
+                
+                # 任务损失 (L_task)
+                L_task = self.loss_fn(logits.view(-1, logits.size(-1)), support_target.view(-1))
+                
+                # ✅ 拓扑损失 (L_Topology) - 作用于公理参数
+                axiom_param = fmodel.axiom_memory_pool 
+                L_topology = compute_enhanced_topological_loss(axiom_param)
+                
+                # L_inner = L_task + L_topology
+                # 简化：使用固定 lambda 权重
+                lambda_meta = 0.01
+                L_inner = L_task + lambda_meta * L_topology
+                
+                # 内部梯度更新
+                diffopt.step(L_inner)
+            
+            # 外循环：在适应后的模型上评估 Query Set 性能
+            query_logits, _ = fmodel(query_input)
+            L_outer = self.loss_fn(query_logits.view(-1, query_logits.size(-1)), query_target.view(-1))
+        
+        # 元学习器更新
+        self.meta_optimizer.zero_grad()
+        L_outer.backward()
+        self.meta_optimizer.step()
+        
+        # 计算查询集准确率
+        pred = torch.argmax(query_logits, dim=-1)
+        accuracy = (pred == query_target).float().mean().item()
+
+        return L_outer.item(), L_topology.item(), accuracy
+
+# --- 4. 虚拟数据集和运行 ---
+
+class AbstractAlgebraDataset(Dataset):
+    """虚拟序列分类数据集"""
+    def __init__(self, data_size=1000, seq_len=20, vocab_size=1000, num_classes=10):
+        self.data_size = data_size
+        self.seq_len = seq_len
+        self.vocab_size = vocab_size
+        self.num_classes = num_classes
+        self.data = torch.randint(0, vocab_size, (data_size, seq_len))
+        # 假设目标是序列分类
+        self.targets = torch.randint(0, num_classes, (data_size, seq_len)) 
+        
+    def __len__(self):
+        return self.data_size
+    
+    def __getitem__(self, idx):
+        return self.data[idx], self.targets[idx]
+
+class MetaLearningTaskDataset(Dataset):
+    """元学习任务数据集 (N-way K-shot)"""
+    def __init__(self, base_dataset, n_support=5, n_query=5):
+        self.base_dataset = base_dataset
+        self.n_support = n_support
+        self.n_query = n_query
+        self.tasks_per_epoch = len(base_dataset) // (n_support + n_query)
+        
+    def __len__(self):
+        return self.tasks_per_epoch
+    
+    def __getitem__(self, idx):
+        start_idx = idx * (self.n_support + self.n_query)
+        
+        # 获取任务数据
+        support_data, support_targets, query_data, query_targets = [], [], [], []
+        
+        for i in range(self.n_support):
+            data, target = self.base_dataset[start_idx + i]
+            support_data.append(data)
+            support_targets.append(target)
+        
+        for i in range(self.n_query):
+            data, target = self.base_dataset[start_idx + self.n_support + i]
+            query_data.append(data)
+            query_targets.append(target)
+        
+        return {
+            'support': (torch.stack(support_data), torch.stack(support_targets)),
+            'query': (torch.stack(query_data), torch.stack(query_targets))
+        }
+
+def run_tg_mlm_experiment():
+    print("--- 运行拓扑引导元学习 (TG-MLM) 示例 ---")
+    
+    # 设置超参数
+    d_model = 128
+    nhead = 4
+    d_hid = 256
+    nlayers = 3
+    ntoken = 500  # 词汇表大小
+    epochs = 3
+    
+    # 1. 创建基础模型和TG-MLM模型
+    base_model = DynamicAxiomTransformer(ntoken, d_model, nhead, d_hid, nlayers).to(device)
+    tg_mlm = TopologyGuidedMetaLearningModel(base_model).to(device)
+    
+    # 2. 创建数据集
+    train_dataset = AbstractAlgebraDataset(data_size=5000, seq_len=15, vocab_size=ntoken)
+    meta_task_dataset = MetaLearningTaskDataset(train_dataset, n_support=5, n_query=5)
+    meta_task_loader = DataLoader(meta_task_dataset, batch_size=1, shuffle=True)
+    
+    # 3. 训练循环
+    print("开始元训练...")
+    
+    for epoch in range(epochs):
+        total_outer_loss = 0
+        total_topology_loss = 0
+        total_accuracy = 0
+        task_count = 0
+        
+        for batch_idx, task_data in enumerate(meta_task_loader):
+            if batch_idx > 50: break # 限制任务数量，加速示例运行
+            
+            L_outer, L_topology, acc = tg_mlm.meta_train_step(task_data)
+            
+            total_outer_loss += L_outer
+            total_topology_loss += L_topology
+            total_accuracy += acc
+            task_count += 1
+            
+            if batch_idx % 10 == 0:
+                print(f"Epoch {epoch+1} | Task {batch_idx}: Outer Loss={L_outer:.4f}, Topology Loss={L_topology:.4f}, Query Acc={acc:.4f}")
+
+        avg_outer_loss = total_outer_loss / task_count
+        avg_topology_loss = total_topology_loss / task_count
+        avg_accuracy = total_accuracy / task_count
+        
+        print(f"\n--- Epoch {epoch+1} 总结 ---")
+        print(f"平均外循环损失: {avg_outer_loss:.4f}, 平均拓扑损失: {avg_topology_loss:.4f}, 平均查询准确率: {avg_accuracy:.4f}\n")
+
+if __name__ == "__main__":
+    run_tg_mlm_experiment()
