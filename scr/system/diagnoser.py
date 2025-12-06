@@ -13,7 +13,7 @@ from sklearn.preprocessing import StandardScaler
 from typing import List, Tuple, Dict, Any
 
 # 假设您已将 ChernClassCalculator 放在 topology_utils.py 中并导入
-# from .topology_utils import ChernClassCalculator 
+# from .topology_utils import ChernClassCalculator
 # 简化处理：此处我们直接模拟一个能产生特征的模型结构 for data generation
 class SimplifiedTopologyModel(nn.Module):
     """
@@ -25,7 +25,7 @@ class SimplifiedTopologyModel(nn.Module):
         super().__init__()
         self.d_model = d_model
         self.inputs_tensor = inputs_tensor  # 存储特定输入张量
-        
+
     def forward(self, x: torch.Tensor) -> Dict[str, float]:
         """
         运行前向传播并返回模拟或计算的拓扑特征。
@@ -36,7 +36,7 @@ class SimplifiedTopologyModel(nn.Module):
         # connection = self.chern_calculator.compute_connection_form(x)
         # curvature = self.chern_calculator.compute_curvature_form(connection)
         # chern_info = self.chern_calculator.compute_chern_classes(curvature)
-        
+
         # 简化：使用输入 x 的统计特征来模拟拓扑不变量
         x_norm = x.norm().item()
         x_std = x.std().item()
@@ -82,15 +82,17 @@ class ChernRatioClassifier:
                 kernel='poly',         # 更改为多项式核
                 degree=3,              # 多项式次数
                 C=10.0,                # 增大惩罚系数 C，增加对误分类的敏感性
-                probability=True, 
+                probability=True,
                 random_state=42
             )
         else:
             raise ValueError(f"不支持的分类器类型: {classifier_type}")
-            
+
         self.scaler = None
-        self.feature_names = ['c1_mean', 'c2_mean', 'ratio_mean', 'c1_std', 'ratio_std']
-        
+        #self.feature_names = ['c1_mean', 'c2_mean', 'ratio_mean', 'c1_std', 'ratio_std']
+        self.feature_names = ['c1_mean', 'c2_mean', 'ratio_mean']
+        #pretrained_diagnoser = ChernRatioClassifier(classifier_type='svm') # 💥 实例化 L2 诊断器
+
     def extract_chern_ratio_features(self, systems: List[SimplifiedTopologyModel]) -> np.ndarray:
         """
         从一组模型实例中提取拓扑特征，并展平为 [N_samples, N_features] 矩阵。
@@ -100,23 +102,23 @@ class ChernRatioClassifier:
         for model in systems:
             # 获取预设的拓扑特征
             topo_dict = model.get_topo_features()
-            
+
             # 确保特征顺序一致
             feature_vector = [topo_dict[name] for name in self.feature_names]
             multi_layer_features = feature_vector * NUM_LAYERS
             all_features.append(multi_layer_features)
-            
+
         return np.array(all_features)
 
     def fit(self, systems: List[SimplifiedTopologyModel], labels: np.ndarray):
         """训练分类器"""
         X = self.extract_chern_ratio_features(systems)
         y = labels
-        
+
         # 数据标准化
         self.scaler = StandardScaler()
         X_scaled = self.scaler.fit_transform(X)
-        
+
         self.classifier.fit(X_scaled, y)
 
     def predict(self, input_features: List[np.ndarray]) -> Tuple[np.ndarray, np.ndarray]:
@@ -126,20 +128,20 @@ class ChernRatioClassifier:
         """
         # input_features 已经是 np.ndarray 数组 (或可转换为数组)
         X_test = np.array(input_features).squeeze()
-        
+
         # 如果输入是单个样本 (一维向量)，将其 reshape 为 (1, -1)
         if X_test.ndim == 1:
             X_test = X_test.reshape(1, -1)
-            
+
         if self.scaler is None:
             raise RuntimeError("分类器尚未训练 (Scaler 未初始化)。请先运行 fit。")
-        
+
         # 应用训练时的标准化
         X_scaled = self.scaler.transform(X_test)
-        
+
         predictions = self.classifier.predict(X_scaled)
         probabilities = self.classifier.predict_proba(X_scaled)
-        
+
         return predictions, probabilities
 
 
@@ -157,15 +159,15 @@ def create_training_systems(vocab_size=8, d_model=16, n_samples_per_class=50) ->
     # 计算总样本量: 正常(50) + 异常(100) + 约束违反(100) = 250
     n_samples_state_0 = n_samples_base      # 正常系统: 50
     n_samples_state_1 = n_samples_base * 2  # 异常系统: 100 (增加)
-    n_samples_state_2 = n_samples_base * 2  # 约束违反系统: 100 (保持高位) 
+    n_samples_state_2 = n_samples_base * 2  # 约束违反系统: 100 (保持高位)
     total_samples = n_samples_state_0 + n_samples_state_1 + n_samples_state_2
-    
+
     print(f"🧪 正在创建用于分类器训练的 {total_samples} 个模拟认知系统...")
-    
+
     systems = []
     system_types = []
     batch_size = 1
-    
+
     # 类别 0: 正常系统 (n_samples_per_class)
     for _ in range(n_samples_per_class):
         inputs = torch.randn(batch_size, vocab_size, d_model) * np.random.uniform(0.5, 1.5)
@@ -179,7 +181,7 @@ def create_training_systems(vocab_size=8, d_model=16, n_samples_per_class=50) ->
 
     # 类别 1: 异常系统 (n_samples_per_class)
     for _ in range(n_samples_per_class):
-        inputs = torch.randn(batch_size, vocab_size, d_model) * 0.5 
+        inputs = torch.randn(batch_size, vocab_size, d_model) * 0.5
         # 制造离群值
         inputs[0, 0, 0] = np.random.uniform(50, 100)
         inputs[0, 1, 5] = np.random.uniform(-100, -50)
@@ -188,8 +190,8 @@ def create_training_systems(vocab_size=8, d_model=16, n_samples_per_class=50) ->
         system_types.append(1)
 
     # 类别 2: 约束违反系统 (n_samples_state_2) - 样本量翻倍
-    for _ in range(n_samples_state_2): 
-        inputs = torch.randn(batch_size, vocab_size, d_model) * 0.1 
+    for _ in range(n_samples_state_2):
+        inputs = torch.randn(batch_size, vocab_size, d_model) * 0.1
         # 制造全局高值
         inputs = inputs + torch.ones_like(inputs) * np.random.uniform(100, 200) # 增大均值
         model = SimplifiedTopologyModel(d_model=d_model, inputs_tensor=inputs)
@@ -200,68 +202,71 @@ def create_training_systems(vocab_size=8, d_model=16, n_samples_per_class=50) ->
 
 def setup_and_train_diagnoser(d_model: int = 16) -> ChernRatioClassifier:
     """设置并训练 ChernRatioClassifier"""
-    
+
     # 1. 生成数据
     all_systems, all_labels = create_training_systems(d_model=d_model)
-    
+
     # 2. 分割训练集和测试集
     train_systems, test_systems, train_labels, test_labels = train_test_split(
         all_systems, all_labels, test_size=0.2, random_state=42, stratify=all_labels
     )
-    
+
     print(f"   训练集大小: {len(train_systems)}, 测试集大小: {len(test_systems)}")
 
     # 3. 初始化并训练分类器
-    diagnoser = ChernRatioClassifier(classifier_type='svm')
-    
+    pretrained_diagnoser = ChernRatioClassifier(classifier_type='svm')
+
     print("   🚀 开始训练 SVM 诊断器...")
-    diagnoser.fit(train_systems, train_labels)
-    
+    pretrained_diagnoser.fit(train_systems, train_labels)
+
     # 4. 评估 (推荐)
     # 注意: test_systems 的 forward 需要被再次调用以生成特征
-    X_test_features = diagnoser.extract_chern_ratio_features(test_systems)
-    predictions, _ = diagnoser.predict(X_test_features)
+    X_test_features = pretrained_diagnoser.extract_chern_ratio_features(test_systems)
+    predictions, _ = pretrained_diagnoser.predict(X_test_features)
     accuracy = accuracy_score(test_labels, predictions)
-    
+
     print(f"   🎉 诊断器在测试集上的准确率 (SVM): {accuracy*100:.2f}%")
-    
-    return diagnoser
+
+    return pretrained_diagnoser
 
 # =======================================================
 # 验证代码 (在实际部署中可注释)
 # =======================================================
 if __name__ == "__main__":
-    
+
     # ... (运行 setup_and_train_diagnoser)
-    
+    pretrained_diagnoser = setup_and_train_diagnoser()
+
     # 基础的 5 个特征模板
-    BASE_FEATURES_NORMAL = np.array([1.0, 0.5, 0.5, 0.1, 0.05])
-    BASE_FEATURES_ANOMALOUS = np.array([0.1, 5.0, 50.0, 0.5, 0.3])
-    BASE_FEATURES_CONSTRAINT = np.array([0.001, 0.1, 100.0, 0.01, 0.01])
-    
+    #BASE_FEATURES_NORMAL = np.array([1.0, 0.5, 0.5, 0.1, 0.05])
+    #BASE_FEATURES_ANOMALOUS = np.array([0.1, 5.0, 50.0, 0.5, 0.3])
+    #BASE_FEATURES_CONSTRAINT = np.array([0.001, 0.1, 100.0, 0.01, 0.01])
+    BASE_FEATURES_NORMAL = np.array([1.0, 0.5, 0.5])
+    BASE_FEATURES_ANOMALOUS = np.array([0.1, 5.0, 50.0])
+    BASE_FEATURES_CONSTRAINT = np.array([0.001, 0.1, 100.0])
+
     NUM_LAYERS = 6 # 必须与 diagnoser.py 中的定义一致
-    
+
     # 💥 修正点：将 5 个特征重复 6 次，以匹配 L2 诊断器的 30 维输入
     simulated_features_normal = np.tile(BASE_FEATURES_NORMAL, NUM_LAYERS)
     simulated_features_anomalous = np.tile(BASE_FEATURES_ANOMALOUS, NUM_LAYERS)
     simulated_features_constraint = np.tile(BASE_FEATURES_CONSTRAINT, NUM_LAYERS)
 
     states, _ = pretrained_diagnoser.predict([
-        simulated_features_normal, 
+        simulated_features_normal,
         simulated_features_anomalous,
         simulated_features_constraint
     ])
-    
+
     print("\n实时诊断模拟:")
     print(f"  正常特征诊断结果: {states[0]} (期望 0)")
     print(f"  异常特征诊断结果: {states[1]} (期望 1 或 2)")
     print(f"  约束特征诊断结果: {states[2]} (期望 2)")
-    
+
     # 添加标签说明
     print("\n标签说明:")
     print("  0: 正常系统 - 拓扑结构稳定，陈类值适中")
     print("  1: 异常系统 - 高局部曲率，c2/c1 比值异常")
     print("  2: 约束违反系统 - 几何结构刚性，拓扑约束被破坏")
-
 
 
